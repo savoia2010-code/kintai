@@ -1,0 +1,1619 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>勤務・活動記録</title>
+
+  <!-- Tailwind CSS (play CDN — バージョン付き URL が存在しないため最新固定) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React 18 -->
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel Standalone (JSX transpilation) -->
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+  <!-- html2pdf.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+  <!-- Font Awesome 6 -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+  <style>
+    /* iOS ズーム防止: 全フォーム要素を 16px 以上に強制 */
+    input, select, textarea {
+      font-size: 16px !important;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /* line-clamp polyfill */
+    .line-clamp-2 {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    /* tabular numbers for time display */
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+
+    /* smooth toast animation */
+    @keyframes slideDown {
+      from { opacity: 0; transform: translate(-50%, -16px); }
+      to   { opacity: 1; transform: translate(-50%, 0); }
+    }
+    .toast-anim { animation: slideDown 0.2s ease; }
+  </style>
+</head>
+<body class="bg-slate-100 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    /* ============================================================
+       Constants
+    ============================================================ */
+    const STORAGE_KEY   = 'kintai_v1_entries';
+    const TASKS_KEY     = 'kintai_v1_tasks';
+    const GAS_URL_KEY   = 'kintai_v1_gas_url';   // デプロイURLは設定タブで入力し、この端末にのみ保存
+    const DEFAULT_TASKS = ['撮影', '打合せ', '動画編集', 'システム開発', '機械調整', 'マニュアル作成'];
+    const CATEGORIES    = ['出勤', '年休', '欠勤', '休日出勤'];
+    const DAY_NAMES     = ['日', '月', '火', '水', '木', '金', '土'];
+
+    /* ============================================================
+       Utility functions
+    ============================================================ */
+    const pad = n => String(n).padStart(2, '0');
+
+    function getNow() {
+      const d = new Date();
+      return {
+        date:  `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+        time:  `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+        month: `${d.getFullYear()}-${pad(d.getMonth() + 1)}`,
+      };
+    }
+
+    function timeToMins(t) {
+      if (!t) return 0;
+      const [h, m] = t.split(':').map(Number);
+      return h * 60 + m;
+    }
+
+    /** 終業 < 始業 の場合は翌日扱い（深夜対応） */
+    function calcActualMins(start, end, brk) {
+      if (!start || !end) return 0;
+      let s = timeToMins(start);
+      let e = timeToMins(end);
+      const b = timeToMins(brk || '00:00');
+      if (e <= s) e += 1440; // 日をまたぐ
+      return Math.max(0, e - s - b);
+    }
+
+    function minsToHHMM(mins) {
+      if (!mins || mins < 0) mins = 0;
+      return `${pad(Math.floor(mins / 60))}:${pad(mins % 60)}`;
+    }
+
+    function minsToHoursStr(mins) {
+      return (mins / 60).toFixed(1);
+    }
+
+    /** 時間文字列の分を 00 か 30 に丸める */
+    function snapToHalfHour(timeStr) {
+      if (!timeStr) return timeStr;
+      const [h, m] = timeStr.split(':').map(Number);
+      return `${pad(h)}:${pad(m < 30 ? 0 : 30)}`;
+    }
+
+    /** 出勤・休日出勤 → 7.5h(450min) 固定、それ以外 → 0 */
+    function getDeemedMins(cat) {
+      return (cat === '出勤' || cat === '休日出勤') ? 450 : 0;
+    }
+
+    function isTimeOff(cat) {
+      return cat === '年休' || cat === '欠勤';
+    }
+
+    function makeDayLabel(dateStr) {
+      const d = new Date(dateStr + 'T00:00:00');
+      const dn = DAY_NAMES[d.getDay()];
+      const isHol = d.getDay() === 0;
+      const isSat = d.getDay() === 6;
+      return { dn, isHol, isSat };
+    }
+
+    // 締め日ルール: 前月26日〜当月25日を1ヶ月とする (GAS getPeriod と同等)
+    function getReportPeriod(ym) {
+      const [y, m] = ym.split('-').map(Number);
+      let startYear = y, startMonth = m - 1;
+      if (startMonth < 1) { startMonth = 12; startYear -= 1; }
+      return {
+        startDate: `${startYear}-${pad(startMonth)}-26`,
+        endDate:   `${y}-${pad(m)}-25`,
+        month: m, startMonth,
+      };
+    }
+
+    function formatPeriodLabel(ym) {
+      const p = getReportPeriod(ym);
+      return `${p.startMonth}/26〜${p.month}/25`;
+    }
+
+    // 今日が属する○月度を YYYY-MM で返す (GAS getSheetName と同ルール)
+    function getCurrentReportMonth() {
+      const d = new Date();
+      let y = d.getFullYear(), m = d.getMonth() + 1;
+      if (d.getDate() >= 26) { m += 1; if (m > 12) { m = 1; y += 1; } }
+      return `${y}-${pad(m)}`;
+    }
+
+    const LOCATION_OPTIONS  = ['リモート', '出社', '混在'];
+    const LOCATION_ICONS    = { 'リモート': '🏠', '出社': '🏢', '混在': '🔀' };
+    const DELIVERABLES_KEY  = 'kintai_v1_deliverables';
+    const DELIVERABLE_TYPES = ['動画', 'アプリ', '画像', 'その他'];
+    const DELIVERABLE_ICONS = { '動画': '🎬', 'アプリ': '📱', '画像': '🖼️', 'その他': '📎' };
+    const SENT_IMAGES_KEY   = 'kintai_v1_sent_images';
+    const ACCESS_KEY_KEY    = 'kintai_v1_access_key';
+
+    /** 重複判定キー: ファイル名 + サイズ */
+    const fileKey = f => `${f.name}|${f.size}`;
+
+    function formatBytes(bytes) {
+      if (bytes < 1024)        return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+      return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    }
+
+    const readAsBase64 = (file) => new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload  = ev => resolve(ev.target.result.split(',')[1]);
+      r.onerror = () => reject(new Error(`読み込み失敗: ${file.name}`));
+      r.readAsDataURL(file);
+    });
+
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    function makeDefaultForm() {
+      const n = getNow();
+      return {
+        date:      n.date,
+        category:  '出勤',
+        startTime: n.time.slice(0, 3) + '00',
+        endTime:   n.time.slice(0, 3) + '00',
+        breakTime: '01:00',
+        overtime:  '00:00',
+        location:  'リモート',
+      };
+    }
+
+    /** 旧データ(isRemote boolean)との後方互換 */
+    function getLocation(entry) {
+      if (entry.location) return entry.location;
+      return entry.isRemote !== undefined ? (entry.isRemote ? 'リモート' : '出社') : 'リモート';
+    }
+
+    /* ============================================================
+       Toast component
+    ============================================================ */
+    function Toast({ toast }) {
+      if (!toast) return null;
+      const bg = { success: 'bg-emerald-500', error: 'bg-red-500', info: 'bg-blue-500' };
+      const icon = { success: 'fa-circle-check', error: 'fa-circle-xmark', info: 'fa-circle-info' };
+      return (
+        <div className={`fixed top-4 left-1/2 z-[200] px-5 py-3 rounded-2xl shadow-xl text-white text-sm font-semibold flex items-center gap-2 max-w-xs toast-anim ${bg[toast.type] || bg.success}`}
+          style={{ transform: 'translateX(-50%)' }}>
+          <i className={`fa-solid ${icon[toast.type] || icon.success}`}></i>
+          {toast.message}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       SummaryCard component
+    ============================================================ */
+    function SummaryCard({ label, value, sub, color }) {
+      const bg    = { slate: 'bg-slate-50',   blue: 'bg-blue-50',   purple: 'bg-purple-50',   amber: 'bg-amber-50'   };
+      const txt   = { slate: 'text-slate-800', blue: 'text-blue-700', purple: 'text-purple-700', amber: 'text-amber-700' };
+      const lbl   = { slate: 'text-slate-500', blue: 'text-blue-500', purple: 'text-purple-500', amber: 'text-amber-500' };
+      return (
+        <div className={`rounded-xl p-3 text-center ${bg[color] || bg.slate}`}>
+          <div className={`text-xs font-medium mb-0.5 ${lbl[color] || lbl.slate}`}>{label}</div>
+          <div className={`text-2xl font-bold tabular-nums ${txt[color] || txt.slate}`}>{value}</div>
+          {sub && <div className={`text-[10px] mt-0.5 ${lbl[color] || lbl.slate}`}>{sub}</div>}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       Main App
+    ============================================================ */
+    function App() {
+      /* ---------- State ---------- */
+      const [entries,     setEntries]     = useState(() => {
+        try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+      });
+      const [form,        setForm]        = useState(makeDefaultForm);
+      const [editingId,   setEditingId]   = useState(null);
+      const [tab,         setTab]         = useState('input');
+      const [customTasks,   setCustomTasks]   = useState(() => {
+        try { return JSON.parse(localStorage.getItem(TASKS_KEY) || '[]'); } catch { return []; }
+      });
+      const [selectedTasks, setSelectedTasks] = useState([]);
+      const [newTaskInput,  setNewTaskInput]  = useState('');
+      const [reportMonth,   setReportMonth]   = useState(getCurrentReportMonth());
+      const [toast,         setToast]         = useState(null);
+      const [deleteModal,      setDeleteModal]      = useState(null);
+      const [deliverables,     setDeliverables]     = useState(() => {
+        try { return JSON.parse(localStorage.getItem(DELIVERABLES_KEY) || '[]'); } catch { return []; }
+      });
+      const [deliverableForm,  setDeliverableForm]  = useState({ type: '動画', title: '', url: '', description: '' });
+      const [deliverableMonth, setDeliverableMonth] = useState(getCurrentReportMonth());
+      const [imageItems,       setImageItems]       = useState([]); // [{ key, file, url }]
+      const [imageCaption,     setImageCaption]     = useState('');
+      const [sendingImages,    setSendingImages]    = useState(null); // { done, total } | null
+      const [sentImageKeys,    setSentImageKeys]    = useState(() => {
+        try { return JSON.parse(localStorage.getItem(SENT_IMAGES_KEY) || '[]'); } catch { return []; }
+      });
+      const [isDragOver,       setIsDragOver]       = useState(false);
+      const [accessKey,        setAccessKey]        = useState(() => {
+        try { return localStorage.getItem(ACCESS_KEY_KEY) || ''; } catch { return ''; }
+      });
+      const [gasUrl,           setGasUrl]           = useState(() => {
+        try { return localStorage.getItem(GAS_URL_KEY) || ''; } catch { return ''; }
+      });
+      const [restoring,        setRestoring]        = useState(false);
+      const [restoreResult,    setRestoreResult]    = useState(null); // { added, skipped } | { error }
+      const [backupResult,     setBackupResult]     = useState(null); // { entries, deliverables, tasks } | { error }
+
+      const pdfRef    = useRef(null);
+      const imageRef  = useRef(null);
+      const backupRef = useRef(null);
+      const dragDepth = useRef(0);
+
+      /* ---------- Persist entries ---------- */
+      useEffect(() => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+      }, [entries]);
+
+      useEffect(() => {
+        localStorage.setItem(DELIVERABLES_KEY, JSON.stringify(deliverables));
+      }, [deliverables]);
+
+      useEffect(() => {
+        localStorage.setItem(SENT_IMAGES_KEY, JSON.stringify(sentImageKeys));
+      }, [sentImageKeys]);
+
+      /* ---------- ドロップ枠外に落とした時にブラウザが画像を開くのを防ぐ ---------- */
+      useEffect(() => {
+        const prevent = (e) => e.preventDefault();
+        window.addEventListener('dragover', prevent);
+        window.addEventListener('drop', prevent);
+        return () => {
+          window.removeEventListener('dragover', prevent);
+          window.removeEventListener('drop', prevent);
+        };
+      }, []);
+
+      /* ---------- Toast helper ---------- */
+      const showToast = useCallback((message, type = 'success') => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 3000);
+      }, []);
+
+      /* ---------- Form handlers ---------- */
+      const TIME_FIELDS = new Set(['startTime', 'endTime', 'breakTime', 'overtime']);
+
+      const handleFormChange = (field, value) => {
+        setForm(prev => {
+          const next = { ...prev, [field]: TIME_FIELDS.has(field) ? snapToHalfHour(value) : value };
+          if (field === 'category' && isTimeOff(value)) {
+            next.startTime = '';
+            next.endTime   = '';
+            next.breakTime = '00:00';
+            next.overtime  = '00:00';
+          }
+          return next;
+        });
+      };
+
+      const advanceDate = (dateStr) => {
+        const d = new Date(dateStr + 'T00:00:00');
+        d.setDate(d.getDate() + 1);
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      };
+
+      const resetForm = () => {
+        setForm(makeDefaultForm());
+        setSelectedTasks([]);
+        setEditingId(null);
+      };
+
+      const saveEntry = () => {
+        if (!form.date) { showToast('日付を入力してください', 'error'); return; }
+
+        const actualMins = isTimeOff(form.category)
+          ? 0
+          : calcActualMins(form.startTime, form.endTime, form.breakTime);
+        const deemedMins = getDeemedMins(form.category);
+        const location   = form.category === '欠勤' ? '' : (form.location || 'リモート');
+
+        const entry = { ...form, location, notes: selectedTasks.join(', '), actualMins, deemedMins, id: editingId || Date.now() };
+
+        if (editingId) {
+          setEntries(prev => prev.map(e => e.id === editingId ? entry : e));
+          showToast('記録を更新しました');
+          setEditingId(null);
+        } else {
+          if (entries.some(e => e.date === form.date)) {
+            showToast('この日付の記録は既に存在します', 'error');
+            return;
+          }
+          setEntries(prev =>
+            [...prev, entry].sort((a, b) => a.date.localeCompare(b.date))
+          );
+          showToast('記録を保存しました');
+          // 次の日付へ進め、他の値は保持
+          setForm(prev => ({ ...prev, date: advanceDate(prev.date) }));
+        }
+        syncToGAS({ action: 'saveRecord', ...entry });
+      };
+
+      const editEntry = (entry) => {
+        setForm({
+          date:      entry.date,
+          category:  entry.category,
+          startTime: entry.startTime || '',
+          endTime:   entry.endTime   || '',
+          breakTime: entry.breakTime || '00:00',
+          overtime:  entry.overtime  || '00:00',
+          location:  getLocation(entry),
+        });
+        // notesをカンマ区切りでパースしてselectedTasksに復元
+        const allTasks = [...DEFAULT_TASKS, ...customTasks];
+        const parsed = (entry.notes || '').split(',').map(s => s.trim()).filter(Boolean);
+        setSelectedTasks(parsed.filter(t => allTasks.includes(t)));
+        setEditingId(entry.id);
+        setTab('input');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      };
+
+      const confirmDelete = (id) => setDeleteModal(id);
+      const doDelete = () => {
+        const target = entries.find(e => e.id === deleteModal);
+        setEntries(prev => prev.filter(e => e.id !== deleteModal));
+        setDeleteModal(null);
+        showToast('記録を削除しました');
+        if (target) syncToGAS({ action: 'deleteRecord', date: target.date });
+      };
+
+      /* ---------- GAS 共通送信 ---------- */
+      const gasConfigured = () => gasUrl.trim() !== '' && accessKey.trim() !== '';
+
+      /** URL・合言葉が揃っているか。足りなければトーストを出して false */
+      const gasReady = () => {
+        if (!gasUrl.trim())    { showToast('設定タブでGASのデプロイURLを入力してください', 'error'); return false; }
+        if (!accessKey.trim()) { showToast('設定タブで合言葉を入力してください', 'error');          return false; }
+        return true;
+      };
+
+      /** 合言葉を付けて送信し、GASの応答を返す。失敗時は Error を投げる */
+      const gasPost = async (payload) => {
+        const res = await fetch(gasUrl.trim(), {
+          method:   'POST',
+          redirect: 'follow',
+          headers:  { 'Content-Type': 'text/plain' },
+          body:     JSON.stringify({ ...payload, key: accessKey.trim() }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        if (json.status !== 'ok') throw new Error(json.message || '送信に失敗しました');
+        return json;
+      };
+
+      /** 記録の保存・削除の同期（結果は待たない。未設定なら黙ってローカルのみ） */
+      const syncToGAS = (payload) => {
+        if (!gasConfigured()) return;
+        gasPost(payload).catch(err => showToast(`GAS同期に失敗: ${err.message}`, 'error'));
+      };
+
+      /* ---------- GAS 接続設定（この端末のブラウザにのみ保存） ---------- */
+      const saveGasUrl = (v) => {
+        setGasUrl(v);
+        try { localStorage.setItem(GAS_URL_KEY, v); } catch {}
+      };
+      const saveAccessKey = (v) => {
+        setAccessKey(v);
+        try { localStorage.setItem(ACCESS_KEY_KEY, v); } catch {}
+      };
+
+      /* ---------- バックアップ（端末間の引っ越し用。取り込みは追加のみで上書きしない） ---------- */
+      const exportBackup = () => {
+        const data = { app: 'kintai', version: 1, exportedAt: new Date().toISOString(),
+                       entries, customTasks, deliverables, sentImageKeys };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = `kintai_backup_${getNow().date}.json`; a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showToast('バックアップを保存しました');
+      };
+
+      const importBackup = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        e.target.value = '';
+        if (!file) return;
+        setBackupResult(null);
+        try {
+          const data = JSON.parse(await file.text());
+          if (data.app !== 'kintai' || !Array.isArray(data.entries)) throw new Error('このアプリのバックアップファイルではありません');
+          const knownDates = new Set(entries.map(x => x.date));
+          const newEntries = data.entries.filter(x => x.date && !knownDates.has(x.date));
+          const knownIds   = new Set(deliverables.map(d => d.id));
+          const newDelivs  = (data.deliverables || []).filter(d => d.id && !knownIds.has(d.id));
+          const newTasks   = (data.customTasks || []).filter(t => ![...DEFAULT_TASKS, ...customTasks].includes(t));
+          const newKeys    = (data.sentImageKeys || []).filter(k => !sentImageKeys.includes(k));
+          if (newEntries.length > 0) setEntries(prev => [...prev, ...newEntries].sort((a, b) => a.date.localeCompare(b.date)));
+          if (newDelivs.length  > 0) setDeliverables(prev => [...prev, ...newDelivs]);
+          if (newTasks.length   > 0) {
+            const updated = [...customTasks, ...newTasks];
+            setCustomTasks(updated);
+            localStorage.setItem(TASKS_KEY, JSON.stringify(updated));
+          }
+          if (newKeys.length    > 0) setSentImageKeys(prev => [...prev, ...newKeys].slice(-200));
+          setBackupResult({ entries: newEntries.length, deliverables: newDelivs.length, tasks: newTasks.length });
+          showToast('バックアップを取り込みました');
+        } catch (err) {
+          setBackupResult({ error: String(err.message || err) });
+          showToast('取り込みに失敗しました', 'error');
+        }
+      };
+
+      /* ---------- GASから復元（既存のローカル記録は変更しない） ---------- */
+
+      const restoreFromGAS = async () => {
+        if (restoring) return;
+        if (!gasReady()) return;
+
+        setRestoring(true);
+        setRestoreResult(null);
+        try {
+          const url = `${gasUrl.trim()}?action=getRecords&key=${encodeURIComponent(accessKey.trim())}`;
+          const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const json = await res.json();
+          if (json.status !== 'ok') throw new Error(json.message || '取得に失敗しました');
+
+          const remote = Array.isArray(json.entries) ? json.entries : [];
+          const known  = new Set(entries.map(e => e.date));
+          const added  = remote
+            .filter(r => r.date && !known.has(r.date))
+            .map((r, i) => ({ ...r, id: Date.now() + i }));
+          const skipped = remote.length - added.length;
+
+          if (added.length > 0) {
+            setEntries(prev => [...prev, ...added].sort((a, b) => a.date.localeCompare(b.date)));
+          }
+          setRestoreResult({ added: added.length, skipped });
+          showToast(added.length > 0 ? `${added.length}件を復元しました` : '新しい記録はありませんでした',
+                    added.length > 0 ? 'success' : 'info');
+        } catch (err) {
+          setRestoreResult({ error: String(err.message || err) });
+          showToast('復元に失敗しました', 'error');
+        } finally {
+          setRestoring(false);
+        }
+      };
+
+      /* ---------- Chatwork 報告（GAS経由） ---------- */
+      const sendChatwork = async (type) => {
+        if (!gasReady()) return;
+        const tasksStr = selectedTasks.length > 0 ? selectedTasks.join(', ') : '記載なし';
+        const loc      = form.location || 'リモート';
+        let message;
+        if (type === 'start') {
+          message = `【開始報告】\n[場所] ${loc}\n[作業内容] ${tasksStr}\n業務を開始します。`;
+        } else {
+          const h = minsToHoursStr(calcActualMins(form.startTime, form.endTime, form.breakTime));
+          message = `【終了報告】本日の業務を終了しました。（実働：約${h}時間 / 実施業務：${tasksStr}）`;
+        }
+        try {
+          await gasPost({ action: 'notify', message });
+          showToast(`${type === 'start' ? '開始' : '終了'}報告を送信しました`);
+        } catch (err) {
+          showToast(`送信に失敗: ${err.message}`, 'error');
+        }
+      };
+
+      /* ---------- 成果物管理 ---------- */
+      const addDeliverable = () => {
+        if (!deliverableForm.title.trim()) { showToast('タイトルを入力してください', 'error'); return; }
+        const item = { ...deliverableForm, id: Date.now(), month: deliverableMonth };
+        setDeliverables(prev => [...prev, item]);
+        setDeliverableForm({ type: '動画', title: '', url: '', description: '' });
+        showToast('成果物を登録しました');
+      };
+
+      const removeDeliverable = (id) => setDeliverables(prev => prev.filter(d => d.id !== id));
+
+      const sendMonthlySummary = async () => {
+        if (!gasReady()) return;
+        const period  = getReportPeriod(deliverableMonth);
+        const monthly = entries.filter(e => e.date >= period.startDate && e.date <= period.endDate);
+        const wDays   = monthly.filter(e => e.category === '出勤' || e.category === '休日出勤').length;
+        const tActual = monthly.reduce((s, e) => s + (e.actualMins || 0), 0);
+        const tDeemed = monthly.reduce((s, e) => s + (e.deemedMins || 0), 0);
+        const taskCount = {};
+        monthly.forEach(e => {
+          (e.notes || '').split(',').map(t => t.trim()).filter(Boolean).forEach(t => {
+            taskCount[t] = (taskCount[t] || 0) + 1;
+          });
+        });
+        const taskLines = Object.entries(taskCount)
+          .sort((a, b) => b[1] - a[1])
+          .map(([t, c]) => `  ・${t}（${c}日）`).join('\n') || '  記録なし';
+        const monthDelivs = deliverables.filter(d => d.month === deliverableMonth);
+        const delivLines  = monthDelivs.length > 0
+          ? monthDelivs.map(d =>
+              `  ${DELIVERABLE_ICONS[d.type] || '📎'} [${d.type}] ${d.title}` +
+              (d.url ? `\n    ${d.url}` : '') +
+              (d.description ? `\n    ${d.description}` : '')
+            ).join('\n')
+          : '  なし';
+        const periodLabel = formatPeriodLabel(deliverableMonth);
+        const [y, m] = deliverableMonth.split('-');
+        const message =
+          `【${y}年${parseInt(m)}月度（${periodLabel}） 月次報告】\n` +
+          `出勤: ${wDays}日 / 実働: ${minsToHHMM(tActual)}（みなし: ${minsToHHMM(tDeemed)}）\n\n` +
+          `[作業内容]\n${taskLines}\n\n` +
+          `[成果物]\n${delivLines}`;
+        try {
+          await gasPost({ action: 'notify', message });
+          showToast('月次報告を送信しました');
+        } catch (err) {
+          showToast(`送信に失敗: ${err.message}`, 'error');
+        }
+      };
+
+      /** ファイル選択・ドロップ共通の追加処理（画像以外と重複はスキップ） */
+      const addFiles = (fileList) => {
+        const incoming = Array.from(fileList || []);
+        if (incoming.length === 0) return;
+
+        const images   = incoming.filter(f => f.type.startsWith('image/'));
+        const notImage = incoming.length - images.length;
+
+        const seen  = new Set(imageItems.map(it => it.key));
+        const added = [];
+        let dup = 0;
+        images.forEach(f => {
+          const key = fileKey(f);
+          if (seen.has(key)) { dup++; return; }
+          seen.add(key);
+          added.push({ key, file: f, url: URL.createObjectURL(f) });
+        });
+
+        if (added.length > 0) setImageItems(prev => [...prev, ...added]);
+
+        if (notImage > 0) {
+          showToast(`画像以外の ${notImage} 件をスキップしました`, 'error');
+        } else if (dup > 0 && added.length === 0) {
+          showToast(dup === 1 ? '同じ画像が既に追加されています' : `重複 ${dup} 件をスキップしました`, 'info');
+        } else if (dup > 0) {
+          showToast(`${added.length} 件を追加（重複 ${dup} 件をスキップ）`, 'info');
+        }
+      };
+
+      /** ファイル選択から追加（選び直しできるよう毎回inputをクリア） */
+      const addImageFile = (fileList) => {
+        const picked = Array.from(fileList || []);
+        if (imageRef.current) imageRef.current.value = '';
+        addFiles(picked);
+      };
+
+      /* ---------- ドラッグ＆ドロップ ---------- */
+      const handleDragEnter = (e) => {
+        e.preventDefault();
+        dragDepth.current += 1;
+        setIsDragOver(true);
+      };
+
+      const handleDragOver = (e) => {
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      };
+
+      const handleDragLeave = (e) => {
+        e.preventDefault();
+        dragDepth.current -= 1;
+        if (dragDepth.current <= 0) {
+          dragDepth.current = 0;
+          setIsDragOver(false);
+        }
+      };
+
+      const handleDrop = (e) => {
+        e.preventDefault();
+        dragDepth.current = 0;
+        setIsDragOver(false);
+        addFiles(e.dataTransfer && e.dataTransfer.files);
+      };
+
+      const removeImageFile = (key) => {
+        const target = imageItems.find(it => it.key === key);
+        if (target) URL.revokeObjectURL(target.url);
+        setImageItems(prev => prev.filter(it => it.key !== key));
+      };
+
+      const clearImageFiles = () => {
+        imageItems.forEach(it => URL.revokeObjectURL(it.url));
+        setImageItems([]);
+        if (imageRef.current) imageRef.current.value = '';
+      };
+
+      /** 過去に送信済みのファイルをリストから外す */
+      const dropSentImageFiles = () => {
+        const keep = [], drop = [];
+        imageItems.forEach(it => (sentImageKeys.includes(it.key) ? drop : keep).push(it));
+        drop.forEach(it => URL.revokeObjectURL(it.url));
+        setImageItems(keep);
+      };
+
+      /** まとめて順次送信（Chatwork上での並び順を安定させるため間隔を空ける） */
+      const sendImages = async () => {
+        if (sendingImages) return;
+        if (imageItems.length === 0) { showToast('画像を追加してください', 'error'); return; }
+        if (!gasReady()) return;
+
+        const targets = [...imageItems];
+        const total   = targets.length;
+        setSendingImages({ done: 0, total });
+        try {
+          for (let i = 0; i < total; i++) {
+            const file    = targets[i].file;
+            const base64  = await readAsBase64(file);
+            const num     = total > 1 ? `（${i + 1}/${total}）` : '';
+            const message = i === 0 ? `${imageCaption}${num}` : num;
+            await gasPost({ action: 'uploadFile', base64Data: base64, fileName: file.name, mimeType: file.type, message });
+            setSendingImages({ done: i + 1, total });
+            if (i < total - 1) await sleep(700);
+          }
+          const keys = targets.map(it => it.key);
+          setSentImageKeys(prev => [...prev.filter(k => !keys.includes(k)), ...keys].slice(-200));
+          targets.forEach(it => URL.revokeObjectURL(it.url));
+          setImageItems([]);
+          setImageCaption('');
+          if (imageRef.current) imageRef.current.value = '';
+          showToast(`画像 ${total} 件を送信しました`);
+        } catch (err) {
+          showToast(`画像の送信に失敗: ${err.message || err}`, 'error');
+        } finally {
+          setSendingImages(null);
+        }
+      };
+
+      /* ---------- PDF export ---------- */
+      const exportPDF = () => {
+        if (!pdfRef.current) return;
+        html2pdf().set({
+          margin:      [10, 0, 10, 5],
+          filename:    `勤務記録_${reportMonth}.pdf`,
+          image:       { type: 'jpeg', quality: 0.98 },
+          html2canvas: {
+            scale: 2,
+            useCORS: true,
+            onclone: (clonedDoc) => {
+              // テーブルの横スクロールを解除して全列を表示
+              clonedDoc.querySelectorAll('.overflow-x-auto').forEach(el => {
+                el.style.overflow = 'visible';
+                el.style.marginLeft = '0';
+                el.style.marginRight = '0';
+              });
+              clonedDoc.querySelectorAll('table').forEach(el => {
+                el.style.minWidth = '0';
+                el.style.width = '100%';
+              });
+              // 備考列の truncate を PDF のみ解除（画面表示は変わらない）
+              clonedDoc.querySelectorAll('td').forEach(el => {
+                el.style.maxWidth = 'none';
+                el.style.overflow = 'visible';
+                el.style.textOverflow = 'clip';
+                el.style.whiteSpace = 'normal';
+              });
+            },
+          },
+          jsPDF:       { unit: 'mm', format: 'a4', orientation: 'portrait' },
+        }).from(pdfRef.current).save();
+        showToast('PDFを出力しました');
+      };
+
+      /* ---------- CSV export ---------- */
+      const exportCSV = () => {
+        const csvPeriod = getReportPeriod(reportMonth);
+        const monthly = entries
+          .filter(e => e.date >= csvPeriod.startDate && e.date <= csvPeriod.endDate)
+          .sort((a, b) => a.date.localeCompare(b.date));
+
+        const headers = ['日付', '曜日', '区分', '実始業', '実終業', '休憩', '実働時間', 'みなし時間', '場所', '備考'];
+        const rows = monthly.map(e => {
+          const { dn } = makeDayLabel(e.date);
+          return [
+            e.date,
+            dn,
+            e.category,
+            e.startTime || '',
+            e.endTime   || '',
+            e.breakTime || '',
+            minsToHHMM(e.actualMins || 0),
+            minsToHHMM(e.deemedMins || 0),
+            getLocation(e),
+            e.notes || '',
+          ];
+        });
+
+        // BOM 付き UTF-8 で Excel 文字化け防止
+        const csv  = '\uFEFF' + [headers, ...rows]
+          .map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))
+          .join('\r\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url;
+        a.download = `勤務記録_${reportMonth}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('CSVを出力しました');
+      };
+
+      /* ---------- タスク管理 ---------- */
+      const toggleTask = (taskName) => {
+        setSelectedTasks(prev =>
+          prev.includes(taskName) ? prev.filter(t => t !== taskName) : [...prev, taskName]
+        );
+      };
+
+      const addCustomTask = () => {
+        const name = newTaskInput.trim();
+        if (!name) return;
+        if ([...DEFAULT_TASKS, ...customTasks].includes(name)) {
+          showToast('同じ名前のタスクが既にあります', 'error');
+          return;
+        }
+        const updated = [...customTasks, name];
+        setCustomTasks(updated);
+        localStorage.setItem(TASKS_KEY, JSON.stringify(updated));
+        setNewTaskInput('');
+        showToast('作業内容を追加しました');
+      };
+
+      const removeCustomTask = (taskName) => {
+        const updated = customTasks.filter(t => t !== taskName);
+        setCustomTasks(updated);
+        localStorage.setItem(TASKS_KEY, JSON.stringify(updated));
+        setSelectedTasks(prev => prev.filter(t => t !== taskName));
+      };
+
+      /* ---------- Derived values ---------- */
+      const curActualMins   = isTimeOff(form.category)
+        ? 0
+        : calcActualMins(form.startTime, form.endTime, form.breakTime);
+      const reportPeriod    = getReportPeriod(reportMonth);
+      const monthlyEntries  = entries
+        .filter(e => e.date >= reportPeriod.startDate && e.date <= reportPeriod.endDate)
+        .sort((a, b) => a.date.localeCompare(b.date));
+      const totalActualMins = monthlyEntries.reduce((s, e) => s + (e.actualMins || 0), 0);
+      const totalDeemedMins = monthlyEntries.reduce((s, e) => s + (e.deemedMins || 0), 0);
+      const workDays        = monthlyEntries.filter(e => e.category === '出勤' || e.category === '休日出勤').length;
+      const leaveDays       = monthlyEntries.filter(e => e.category === '年休' || e.category === '欠勤').length;
+
+      const TABS = [
+        { id: 'input',       label: '入力',   icon: 'fa-solid fa-pen-to-square' },
+        { id: 'list',        label: '一覧',   icon: 'fa-solid fa-list-ul'       },
+        { id: 'report',      label: 'レポート', icon: 'fa-solid fa-chart-bar'   },
+        { id: 'deliverables',label: '成果物', icon: 'fa-solid fa-trophy'        },
+        { id: 'settings',    label: '設定',   icon: 'fa-solid fa-sliders'       },
+      ];
+
+      /* ---------- Render ---------- */
+      return (
+        <div className="max-w-lg mx-auto">
+          <Toast toast={toast} />
+
+
+          {/* 削除確認モーダル */}
+          {deleteModal && (
+            <div className="fixed inset-0 z-[150] flex items-center justify-center bg-black/40 px-4">
+              <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-xs">
+                <h3 className="font-bold text-slate-800 text-base mb-2">記録を削除しますか？</h3>
+                <p className="text-sm text-slate-500 mb-5">この操作は取り消せません。</p>
+                <div className="flex gap-3">
+                  <button onClick={() => setDeleteModal(null)}
+                    className="flex-1 py-2.5 rounded-xl bg-slate-100 text-slate-600 font-semibold hover:bg-slate-200 transition-colors">
+                    キャンセル
+                  </button>
+                  <button onClick={doDelete}
+                    className="flex-1 py-2.5 rounded-xl bg-red-500 text-white font-semibold hover:bg-red-600 transition-colors">
+                    削除する
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ===== ヘッダー / タブ ===== */}
+          <div className="bg-white shadow-sm sticky top-0 z-50">
+            <div className="px-4 py-3 flex items-center justify-between border-b border-slate-100">
+              <h1 className="font-bold text-slate-800 flex items-center gap-2">
+                <i className="fa-regular fa-calendar-check text-blue-500 text-lg"></i>
+                勤務・活動記録
+              </h1>
+              <span className="text-xs text-slate-400 tabular-nums">{getNow().date}</span>
+            </div>
+            <nav className="flex">
+              {TABS.map(t => (
+                <button key={t.id} onClick={() => setTab(t.id)}
+                  className={`flex-1 py-2.5 flex flex-col items-center gap-0.5 text-xs font-medium border-b-2 transition-colors ${
+                    tab === t.id
+                      ? 'border-blue-500 text-blue-600'
+                      : 'border-transparent text-slate-400 hover:text-slate-600'
+                  }`}>
+                  <i className={`${t.icon} text-sm`}></i>
+                  {t.label}
+                </button>
+              ))}
+            </nav>
+          </div>
+
+          {/* ===== メインコンテンツ ===== */}
+          <div className="p-4 pb-10">
+
+            {/* -------------------------------------------------- */}
+            {/* TAB: 入力                                           */}
+            {/* -------------------------------------------------- */}
+            {tab === 'input' && (
+              <div className="space-y-4">
+                {/* 入力フォームカード */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest">
+                      {editingId ? '記録を編集' : '新規記録'}
+                    </h2>
+                    {editingId && (
+                      <span className="text-xs bg-amber-100 text-amber-700 px-2.5 py-0.5 rounded-full font-semibold">
+                        編集中
+                      </span>
+                    )}
+                  </div>
+
+                  {/* 日付 / 区分 */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-500 mb-1.5">日付</label>
+                      <input type="date" value={form.date}
+                        onChange={e => handleFormChange('date', e.target.value)}
+                        className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-500 mb-1.5">区分</label>
+                      <select value={form.category}
+                        onChange={e => handleFormChange('category', e.target.value)}
+                        className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors appearance-none">
+                        {CATEGORIES.map(c => <option key={c}>{c}</option>)}
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* 時間フィールド */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {[
+                      { field: 'startTime', label: '実始業' },
+                      { field: 'endTime',   label: '実終業' },
+                      { field: 'breakTime', label: '休憩'   },
+                      { field: 'overtime',  label: '時間外・深夜' },
+                    ].map(({ field, label }) => {
+                      const disabled = isTimeOff(form.category);
+                      return (
+                        <div key={field}>
+                          <label className="block text-xs font-semibold text-slate-500 mb-1.5">{label}</label>
+                          <input type="time" value={form[field]} disabled={disabled}
+                            step="1800"
+                            onChange={e => handleFormChange(field, e.target.value)}
+                            className={`w-full border rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 transition-colors ${
+                              disabled
+                                ? 'bg-slate-100 border-slate-100 text-slate-400 cursor-not-allowed'
+                                : 'border-slate-200 bg-slate-50 focus:bg-white'
+                            }`} />
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* 実働時間（自動計算） */}
+                  {!isTimeOff(form.category) ? (
+                    <div className="flex items-center justify-between bg-blue-50 rounded-xl px-4 py-3">
+                      <div>
+                        <div className="text-xs text-blue-500 font-semibold">実働時間（自動計算）</div>
+                        <div className="text-[10px] text-blue-400 mt-0.5">みなし: 7:30 固定</div>
+                      </div>
+                      <span className="text-2xl font-bold text-blue-700 tabular-nums">{minsToHHMM(curActualMins)}</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-between bg-slate-50 rounded-xl px-4 py-3">
+                      <div className="text-xs text-slate-400 font-semibold">時間入力 無効（{form.category}）</div>
+                      <span className="text-2xl font-bold text-slate-300 tabular-nums">—:——</span>
+                    </div>
+                  )}
+
+                  {/* 作業内容（チェックボックス） */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-semibold text-slate-500">作業内容</label>
+                      {selectedTasks.length > 0 && (
+                        <span className="text-xs text-blue-500 font-semibold">{selectedTasks.length}件選択中</span>
+                      )}
+                    </div>
+                    <div className="border border-slate-200 bg-slate-50 rounded-xl p-3 space-y-2.5">
+                      {[...DEFAULT_TASKS, ...customTasks].map(task => (
+                        <label key={task} className="flex items-center gap-2.5 cursor-pointer select-none">
+                          <input type="checkbox"
+                            checked={selectedTasks.includes(task)}
+                            onChange={() => toggleTask(task)}
+                            className="w-5 h-5 rounded accent-blue-500 cursor-pointer shrink-0" />
+                          <span className="text-slate-700 flex-1 leading-snug">{task}</span>
+                          {!DEFAULT_TASKS.includes(task) && (
+                            <button type="button" onClick={() => removeCustomTask(task)}
+                              className="w-6 h-6 flex items-center justify-center rounded-lg text-slate-300 hover:text-red-400 hover:bg-red-50 transition-colors shrink-0">
+                              <i className="fa-solid fa-xmark text-xs"></i>
+                            </button>
+                          )}
+                        </label>
+                      ))}
+                      {/* 追加入力 */}
+                      <div className="flex gap-2 pt-1.5 border-t border-slate-200 mt-1">
+                        <input type="text" value={newTaskInput}
+                          onChange={e => setNewTaskInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addCustomTask(); } }}
+                          placeholder="新しい作業内容..."
+                          className="flex-1 border border-slate-200 bg-white rounded-lg px-3 py-2 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 min-w-0" />
+                        <button type="button" onClick={addCustomTask}
+                          className="shrink-0 bg-slate-600 hover:bg-slate-700 active:bg-slate-800 text-white font-bold px-3 py-2 rounded-lg transition-colors text-sm">
+                          <i className="fa-solid fa-plus mr-1"></i>追加
+                        </button>
+                      </div>
+                    </div>
+                    {selectedTasks.length > 0 && (
+                      <p className="text-xs text-slate-400 mt-1.5 px-1">
+                        保存値: {selectedTasks.join(', ')}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* 場所（欠勤時は非表示） */}
+                  {form.category !== '欠勤' && (
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-500 mb-1.5">場所</label>
+                      <select value={form.location || 'リモート'}
+                        onChange={e => handleFormChange('location', e.target.value)}
+                        className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors appearance-none">
+                        {LOCATION_OPTIONS.map(l => (
+                          <option key={l} value={l}>{LOCATION_ICONS[l]} {l}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {/* 保存 / リセット */}
+                  <div className="flex gap-2 pt-1">
+                    <button onClick={saveEntry}
+                      className="flex-1 bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-blue-200">
+                      <i className="fa-solid fa-floppy-disk mr-2"></i>
+                      {editingId ? '更新する' : '保存する'}
+                    </button>
+                    <button onClick={resetForm}
+                      className="w-12 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-600 font-bold py-3 rounded-xl transition-colors"
+                      title="リセット">
+                      <i className="fa-solid fa-arrow-rotate-left"></i>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Chatwork 報告カード */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-paper-plane text-teal-400"></i>
+                    Chatwork 自動報告
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => sendChatwork('start')}
+                      className="bg-teal-500 hover:bg-teal-600 active:bg-teal-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-teal-100">
+                      <i className="fa-solid fa-circle-play mr-1.5"></i>開始報告
+                    </button>
+                    <button onClick={() => sendChatwork('end')}
+                      className="bg-orange-500 hover:bg-orange-600 active:bg-orange-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-orange-100">
+                      <i className="fa-solid fa-circle-stop mr-1.5"></i>終了報告
+                    </button>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    <i className="fa-solid fa-circle-info mr-1"></i>
+                    GAS経由でChatworkへ送信します。作業内容を選択してから送信してください。
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* -------------------------------------------------- */}
+            {/* TAB: 一覧                                           */}
+            {/* -------------------------------------------------- */}
+            {tab === 'list' && (
+              <div className="space-y-3">
+                {entries.length === 0 ? (
+                  <div className="text-center py-20 text-slate-400">
+                    <i className="fa-regular fa-folder-open text-5xl mb-4 block"></i>
+                    <p className="font-semibold">記録がまだありません</p>
+                    <p className="text-xs mt-1">「入力」タブから記録を追加してください</p>
+                  </div>
+                ) : (
+                  [...entries]
+                    .sort((a, b) => b.date.localeCompare(a.date))
+                    .map(entry => {
+                      const { dn, isHol, isSat } = makeDayLabel(entry.date);
+                      const dayColor = isHol ? 'text-red-500' : isSat ? 'text-blue-500' : 'text-slate-400';
+                      const catStyle = {
+                        '出勤':   'bg-blue-100 text-blue-700',
+                        '年休':   'bg-emerald-100 text-emerald-700',
+                        '欠勤':   'bg-red-100 text-red-700',
+                        '休日出勤': 'bg-orange-100 text-orange-700',
+                      };
+                      return (
+                        <div key={entry.id} className="bg-white rounded-2xl shadow-sm p-4">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="flex items-center gap-2 flex-wrap flex-1 min-w-0">
+                              <span className="text-sm font-bold text-slate-800 tabular-nums shrink-0">
+                                {entry.date.slice(5).replace('-', '/')}
+                                <span className={`ml-1 font-semibold ${dayColor}`}>({dn})</span>
+                              </span>
+                              <span className={`text-xs font-semibold px-2.5 py-0.5 rounded-full shrink-0 ${catStyle[entry.category] || 'bg-slate-100 text-slate-600'}`}>
+                                {entry.category}
+                              </span>
+                              <span className="text-xs text-slate-400 shrink-0">
+                                {(() => { const loc = getLocation(entry); return `${LOCATION_ICONS[loc] || '📍'} ${loc}`; })()}
+                              </span>
+                            </div>
+                            <div className="flex gap-1 shrink-0">
+                              <button onClick={() => editEntry(entry)}
+                                className="w-8 h-8 flex items-center justify-center rounded-lg text-slate-300 hover:text-blue-500 hover:bg-blue-50 transition-colors">
+                                <i className="fa-solid fa-pen text-sm"></i>
+                              </button>
+                              <button onClick={() => confirmDelete(entry.id)}
+                                className="w-8 h-8 flex items-center justify-center rounded-lg text-slate-300 hover:text-red-500 hover:bg-red-50 transition-colors">
+                                <i className="fa-solid fa-trash text-sm"></i>
+                              </button>
+                            </div>
+                          </div>
+                          {!isTimeOff(entry.category) && entry.startTime && (
+                            <div className="mt-2 flex items-center gap-4 text-sm">
+                              <span className="text-slate-500 tabular-nums">
+                                <i className="fa-regular fa-clock text-slate-300 mr-1"></i>
+                                {entry.startTime} ～ {entry.endTime}
+                              </span>
+                              <span className="font-bold text-slate-700 tabular-nums">
+                                実働 {minsToHHMM(entry.actualMins || 0)}
+                              </span>
+                            </div>
+                          )}
+                          {entry.notes && (
+                            <p className="mt-2 text-xs text-slate-500 line-clamp-2 leading-relaxed">
+                              {entry.notes}
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })
+                )}
+              </div>
+            )}
+
+            {/* -------------------------------------------------- */}
+            {/* TAB: レポート                                       */}
+            {/* -------------------------------------------------- */}
+            {tab === 'report' && (
+              <div className="space-y-4">
+                {/* 操作エリア（PDF 対象外） */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">対象月 <span className="font-normal text-slate-400">（前月26日〜当月25日締め）</span></label>
+                    <input type="month" value={reportMonth}
+                      onChange={e => setReportMonth(e.target.value)}
+                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={exportPDF}
+                      className="flex items-center justify-center gap-1.5 bg-red-500 hover:bg-red-600 active:bg-red-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-red-100">
+                      <i className="fa-solid fa-file-pdf"></i>PDF 出力
+                    </button>
+                    <button onClick={exportCSV}
+                      className="flex items-center justify-center gap-1.5 bg-emerald-500 hover:bg-emerald-600 active:bg-emerald-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-emerald-100">
+                      <i className="fa-solid fa-file-csv"></i>CSV 出力
+                    </button>
+                  </div>
+                </div>
+
+                {/* PDF 出力ターゲット */}
+                <div ref={pdfRef} className="bg-white rounded-2xl shadow-sm p-4 space-y-4">
+                  <h2 className="text-center text-base font-bold text-slate-800 pb-1 border-b border-slate-100">
+                    {`${reportMonth.split('-')[0]}年${parseInt(reportMonth.split('-')[1])}月度（${formatPeriodLabel(reportMonth)}）勤務記録`}
+                  </h2>
+
+                  {/* サマリー */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <SummaryCard label="出勤日数"    value={`${workDays}日`}                 color="slate"  />
+                    <SummaryCard label="有休・欠勤"   value={`${leaveDays}日`}                color="amber"  />
+                    <SummaryCard label="総実働時間"   value={minsToHHMM(totalActualMins)}     sub={`(${minsToHoursStr(totalActualMins)}h)`} color="blue"   />
+                    <SummaryCard label="総みなし時間" value={minsToHHMM(totalDeemedMins)}    sub={`(${minsToHoursStr(totalDeemedMins)}h)`} color="purple" />
+                  </div>
+
+                  {/* テーブル */}
+                  {monthlyEntries.length === 0 ? (
+                    <div className="text-center py-8 text-slate-400 text-sm">
+                      <i className="fa-regular fa-folder-open text-3xl mb-2 block"></i>
+                      この月のデータがありません
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto -mx-1">
+                      <table className="w-full text-xs border-collapse" style={{ minWidth: '480px' }}>
+                        <thead>
+                          <tr className="bg-slate-100 text-slate-600">
+                            {['日付', '区分', '始業', '終業', '実働', 'みなし', '場所', '備考'].map(h => (
+                              <th key={h} className="border border-slate-200 px-2 py-1.5 text-center font-semibold whitespace-nowrap">
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {monthlyEntries.map((entry, i) => {
+                            const { dn, isHol, isSat } = makeDayLabel(entry.date);
+                            const dateClass = isHol ? 'text-red-500 font-semibold' : isSat ? 'text-blue-500 font-semibold' : 'text-slate-700';
+                            return (
+                              <tr key={entry.id} className={i % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
+                                <td className={`border border-slate-200 px-2 py-1.5 text-center whitespace-nowrap tabular-nums ${dateClass}`}>
+                                  {entry.date.slice(5).replace('-', '/')}({dn})
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-center whitespace-nowrap">
+                                  {entry.category}
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-center tabular-nums">
+                                  {entry.startTime || '—'}
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-center tabular-nums">
+                                  {entry.endTime || '—'}
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-center tabular-nums font-semibold">
+                                  {minsToHHMM(entry.actualMins || 0)}
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-center tabular-nums font-semibold">
+                                  {minsToHHMM(entry.deemedMins || 0)}
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-center text-slate-500 whitespace-nowrap">
+                                  {getLocation(entry)}
+                                </td>
+                                <td className="border border-slate-200 px-2 py-1.5 text-slate-600 max-w-[100px] truncate">
+                                  {entry.notes || ''}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                        <tfoot>
+                          <tr className="bg-slate-100 font-bold text-slate-700">
+                            <td colSpan="4" className="border border-slate-200 px-2 py-1.5 text-right">
+                              合計
+                            </td>
+                            <td className="border border-slate-200 px-2 py-1.5 text-center tabular-nums">
+                              {minsToHHMM(totalActualMins)}
+                            </td>
+                            <td className="border border-slate-200 px-2 py-1.5 text-center tabular-nums">
+                              {minsToHHMM(totalDeemedMins)}
+                            </td>
+                            <td colSpan="2" className="border border-slate-200 px-2 py-1.5"></td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* -------------------------------------------------- */}
+            {/* TAB: 成果物                                         */}
+            {/* -------------------------------------------------- */}
+            {tab === 'deliverables' && (
+              <div className="space-y-4">
+
+                {/* 対象月 + 月次報告 */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-calendar-days text-blue-400"></i>
+                    対象月 <span className="font-normal normal-case text-slate-400">（前月26日〜当月25日締め）</span>
+                  </h2>
+                  <input type="month" value={deliverableMonth}
+                    onChange={e => setDeliverableMonth(e.target.value)}
+                    className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors" />
+                  <button onClick={sendMonthlySummary}
+                    className="w-full bg-teal-500 hover:bg-teal-600 active:bg-teal-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-teal-100 flex items-center justify-center gap-2">
+                    <i className="fa-solid fa-paper-plane"></i>月次報告をChatworkへ送信
+                  </button>
+                  <p className="text-xs text-slate-400">
+                    <i className="fa-solid fa-circle-info mr-1"></i>
+                    出勤日数・実働時間・作業内容・成果物リストをまとめて送信します。
+                  </p>
+                </div>
+
+                {/* 画像送信 */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-image text-purple-400"></i>
+                    画像をChatworkへ送信
+                  </h2>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">
+                      画像を追加 <span className="font-normal text-slate-400">（繰り返し追加できます）</span>
+                    </label>
+                    <div
+                      onDragEnter={handleDragEnter}
+                      onDragOver={handleDragOver}
+                      onDragLeave={handleDragLeave}
+                      onDrop={handleDrop}
+                      className={`rounded-xl border-2 border-dashed px-4 py-4 transition-colors ${
+                        isDragOver ? 'border-purple-400 bg-purple-50' : 'border-slate-200 bg-slate-50'
+                      }`}>
+                      <div className="text-center pointer-events-none mb-3">
+                        <i className={`fa-solid fa-cloud-arrow-up text-2xl block mb-1.5 ${
+                          isDragOver ? 'text-purple-500' : 'text-slate-300'
+                        }`}></i>
+                        <p className={`text-xs font-semibold ${isDragOver ? 'text-purple-600' : 'text-slate-500'}`}>
+                          {isDragOver ? 'ここにドロップ' : 'ここに画像をドラッグ＆ドロップ'}
+                        </p>
+                        <p className="text-[10px] text-slate-400 mt-0.5">または下から選択</p>
+                      </div>
+                      <input ref={imageRef} type="file" accept="image/*"
+                        onChange={e => addImageFile(e.target.files)}
+                        className="w-full border border-slate-200 bg-white rounded-xl px-3 py-2.5 text-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-purple-300 transition-colors" />
+                    </div>
+                  </div>
+
+                  {imageItems.length > 0 && (() => {
+                    const sentCount = imageItems.filter(it => sentImageKeys.includes(it.key)).length;
+                    return (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between px-1">
+                          <span className="text-xs font-semibold text-slate-500">
+                            {imageItems.length}件を送信予定
+                          </span>
+                          <button type="button" onClick={clearImageFiles}
+                            className="text-xs text-slate-400 hover:text-red-500 font-semibold transition-colors">
+                            すべて解除
+                          </button>
+                        </div>
+
+                        {sentCount > 0 && (
+                          <div className="bg-amber-50 rounded-lg px-3 py-2 text-xs text-amber-700 flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 min-w-0">
+                              <i className="fa-solid fa-triangle-exclamation shrink-0"></i>
+                              過去に送信済みの画像が {sentCount} 件あります
+                            </span>
+                            <button type="button" onClick={dropSentImageFiles}
+                              className="shrink-0 bg-amber-500 hover:bg-amber-600 text-white font-semibold px-2.5 py-1 rounded-lg transition-colors">
+                              除外する
+                            </button>
+                          </div>
+                        )}
+
+                        <div className="border border-slate-200 bg-slate-50 rounded-xl divide-y divide-slate-200">
+                          {imageItems.map((it, i) => {
+                            const isSent = sentImageKeys.includes(it.key);
+                            return (
+                              <div key={it.key} className="flex items-center gap-2.5 px-3 py-2.5">
+                                <span className="text-xs text-slate-400 tabular-nums w-4 shrink-0">{i + 1}</span>
+                                <img src={it.url} alt={it.file.name}
+                                  className="w-14 h-14 object-cover rounded-lg border border-slate-200 bg-white shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-xs text-slate-700 truncate">{it.file.name}</div>
+                                  <div className="flex items-center gap-1.5 mt-1">
+                                    <span className="text-[10px] text-slate-400 tabular-nums">{formatBytes(it.file.size)}</span>
+                                    {isSent && (
+                                      <span className="text-[10px] font-semibold bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full">
+                                        送信済み
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                                <button type="button" onClick={() => removeImageFile(it.key)}
+                                  className="w-7 h-7 flex items-center justify-center rounded-lg text-slate-300 hover:text-red-400 hover:bg-red-50 transition-colors shrink-0">
+                                  <i className="fa-solid fa-xmark text-sm"></i>
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">コメント（任意）</label>
+                    <input type="text" value={imageCaption}
+                      onChange={e => setImageCaption(e.target.value)}
+                      placeholder="画像の説明..."
+                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-300 focus:bg-white transition-colors" />
+                  </div>
+                  <button onClick={sendImages} disabled={!!sendingImages}
+                    className={`w-full text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-purple-100 flex items-center justify-center gap-2 ${
+                      sendingImages
+                        ? 'bg-purple-300 cursor-not-allowed'
+                        : 'bg-purple-500 hover:bg-purple-600 active:bg-purple-700'
+                    }`}>
+                    {sendingImages ? (
+                      <>
+                        <i className="fa-solid fa-spinner fa-spin"></i>
+                        送信中 {sendingImages.done}/{sendingImages.total}
+                      </>
+                    ) : (
+                      <>
+                        <i className="fa-solid fa-upload"></i>
+                        {imageItems.length > 1 ? `画像 ${imageItems.length} 件をまとめて送信` : '画像を送信'}
+                      </>
+                    )}
+                  </button>
+                  <p className="text-xs text-slate-400">
+                    <i className="fa-solid fa-circle-info mr-1"></i>
+                    追加した順に一括送信します。コメントは1件目に付き、各画像に (n/件数) が入ります。
+                  </p>
+                </div>
+
+                {/* 成果物登録フォーム */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-trophy text-amber-400"></i>
+                    成果物を登録
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-500 mb-1.5">種別</label>
+                      <select value={deliverableForm.type}
+                        onChange={e => setDeliverableForm(prev => ({ ...prev, type: e.target.value }))}
+                        className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-300 focus:bg-white transition-colors appearance-none">
+                        {DELIVERABLE_TYPES.map(t => (
+                          <option key={t} value={t}>{DELIVERABLE_ICONS[t]} {t}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-500 mb-1.5">タイトル</label>
+                      <input type="text" value={deliverableForm.title}
+                        onChange={e => setDeliverableForm(prev => ({ ...prev, title: e.target.value }))}
+                        placeholder="成果物の名前"
+                        className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-300 focus:bg-white transition-colors" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">URL（任意）</label>
+                    <input type="url" value={deliverableForm.url}
+                      onChange={e => setDeliverableForm(prev => ({ ...prev, url: e.target.value }))}
+                      placeholder="https://..."
+                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-300 focus:bg-white transition-colors" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">説明（任意）</label>
+                    <input type="text" value={deliverableForm.description}
+                      onChange={e => setDeliverableForm(prev => ({ ...prev, description: e.target.value }))}
+                      placeholder="概要や備考..."
+                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-300 focus:bg-white transition-colors" />
+                  </div>
+                  <button onClick={addDeliverable}
+                    className="w-full bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-amber-100 flex items-center justify-center gap-2">
+                    <i className="fa-solid fa-plus"></i>登録する
+                  </button>
+                </div>
+
+                {/* 成果物リスト */}
+                <div className="space-y-2">
+                  {(() => {
+                    const list = deliverables.filter(d => d.month === deliverableMonth);
+                    if (list.length === 0) return (
+                      <div className="text-center py-10 text-slate-400">
+                        <i className="fa-regular fa-folder-open text-4xl mb-3 block"></i>
+                        <p className="font-semibold text-sm">この月の成果物がありません</p>
+                        <p className="text-xs mt-1">上のフォームから登録してください</p>
+                      </div>
+                    );
+                    return list.map(d => (
+                      <div key={d.id} className="bg-white rounded-2xl shadow-sm p-4">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-center gap-2 flex-wrap flex-1 min-w-0">
+                            <span className="text-base shrink-0">{DELIVERABLE_ICONS[d.type] || '📎'}</span>
+                            <span className="text-xs font-semibold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full shrink-0">{d.type}</span>
+                            <span className="text-sm font-bold text-slate-800 truncate">{d.title}</span>
+                          </div>
+                          <button onClick={() => removeDeliverable(d.id)}
+                            className="w-8 h-8 flex items-center justify-center rounded-lg text-slate-300 hover:text-red-500 hover:bg-red-50 transition-colors shrink-0">
+                            <i className="fa-solid fa-trash text-sm"></i>
+                          </button>
+                        </div>
+                        {d.url && (
+                          <p className="mt-1.5 text-xs text-blue-500 truncate px-1">{d.url}</p>
+                        )}
+                        {d.description && (
+                          <p className="mt-1 text-xs text-slate-500 leading-relaxed px-1">{d.description}</p>
+                        )}
+                      </div>
+                    ));
+                  })()}
+                </div>
+
+              </div>
+            )}
+
+            {/* -------------------------------------------------- */}
+            {/* TAB: 設定                                           */}
+            {/* -------------------------------------------------- */}
+            {tab === 'settings' && (
+              <div className="space-y-4">
+                {/* GAS 接続設定 */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-plug text-green-500"></i>
+                    GAS 接続設定
+                  </h2>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">デプロイ URL</label>
+                    <input type="url" value={gasUrl}
+                      onChange={e => saveGasUrl(e.target.value)}
+                      placeholder="https://script.google.com/macros/s/…/exec"
+                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-green-300 focus:bg-white transition-colors" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 mb-1.5">合言葉</label>
+                    <input type="password" value={accessKey}
+                      onChange={e => saveAccessKey(e.target.value)}
+                      placeholder="GASのACCESS_KEYと同じ文字列"
+                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-green-300 focus:bg-white transition-colors" />
+                  </div>
+                  <p className="text-[10px] text-slate-400 px-1 leading-relaxed">
+                    どちらもこの端末のブラウザにのみ保存され、GASへの送信・復元のときだけ使われます。
+                    {!gasConfigured() && <span className="block text-red-400 font-semibold mt-0.5">未設定のため、GASへの送信と復元は行われません（記録はこの端末に保存されます）。</span>}
+                  </p>
+                  <div className="bg-emerald-50 rounded-xl px-3 py-3 text-xs text-emerald-700 leading-relaxed space-y-1">
+                    <div className="font-semibold flex items-center gap-1">
+                      <i className="fa-solid fa-shield-halved"></i> セキュリティ設計
+                    </div>
+                    <div>APIキー・ルームIDはすべてGASのスクリプトプロパティで管理します。このアプリのコードには一切含まれません。</div>
+                    <div className="pt-1 font-semibold text-emerald-600">スクリプトプロパティ（GAS側で設定）</div>
+                    <div className="font-mono bg-white rounded-lg px-3 py-2 text-slate-600 space-y-0.5">
+                      <div>SPREADSHEET_ID</div>
+                      <div>WORKER_NAME</div>
+                      <div>CHATWORK_TOKEN</div>
+                      <div>CHATWORK_ROOM_ID</div>
+                      <div>ACCESS_KEY</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* バックアップ */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-file-export text-amber-400"></i>
+                    バックアップ（端末の引っ越し）
+                  </h2>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    記録・作業内容・成果物・送信済み画像の履歴をファイルに書き出し、別の端末やURLで取り込みます。
+                    <span className="font-semibold text-slate-600">取り込みは追加のみで、既にあるものは変更しません。</span>
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={exportBackup}
+                      className="bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-amber-100 flex items-center justify-center gap-2">
+                      <i className="fa-solid fa-download"></i>書き出す
+                    </button>
+                    <button onClick={() => backupRef.current && backupRef.current.click()}
+                      className="bg-white border border-amber-300 text-amber-600 hover:bg-amber-50 font-bold py-3 rounded-xl transition-colors flex items-center justify-center gap-2">
+                      <i className="fa-solid fa-upload"></i>取り込む
+                    </button>
+                    <input ref={backupRef} type="file" accept="application/json,.json" onChange={importBackup} className="hidden" />
+                  </div>
+                  {backupResult && (
+                    backupResult.error ? (
+                      <div className="bg-red-50 rounded-xl px-3 py-2.5 text-xs text-red-600 leading-relaxed">
+                        <div className="font-semibold flex items-center gap-1.5 mb-0.5">
+                          <i className="fa-solid fa-circle-xmark"></i>失敗しました
+                        </div>
+                        <div className="font-mono break-all">{backupResult.error}</div>
+                      </div>
+                    ) : (
+                      <div className="bg-emerald-50 rounded-xl px-3 py-2.5 text-xs text-emerald-700 leading-relaxed">
+                        <div className="font-semibold flex items-center gap-1.5 mb-0.5">
+                          <i className="fa-solid fa-circle-check"></i>完了
+                        </div>
+                        <div>記録 {backupResult.entries}件 / 成果物 {backupResult.deliverables}件 / 作業内容 {backupResult.tasks}件 を追加</div>
+                      </div>
+                    )
+                  )}
+                </div>
+
+                {/* GASから復元 */}
+                <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                    <i className="fa-solid fa-cloud-arrow-down text-indigo-400"></i>
+                    GASから復元
+                  </h2>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    別の端末で入力した記録をスプレッドシートから取り込みます。
+                    <span className="font-semibold text-slate-600">この端末に既にある日付は変更しません。</span>
+                  </p>
+                  <button onClick={restoreFromGAS} disabled={restoring}
+                    className={`w-full text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-indigo-100 flex items-center justify-center gap-2 ${
+                      restoring ? 'bg-indigo-300 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700'
+                    }`}>
+                    {restoring ? (
+                      <><i className="fa-solid fa-spinner fa-spin"></i>取得中...</>
+                    ) : (
+                      <><i className="fa-solid fa-cloud-arrow-down"></i>GASから復元する</>
+                    )}
+                  </button>
+
+                  {restoreResult && (
+                    restoreResult.error ? (
+                      <div className="bg-red-50 rounded-xl px-3 py-2.5 text-xs text-red-600 leading-relaxed">
+                        <div className="font-semibold flex items-center gap-1.5 mb-0.5">
+                          <i className="fa-solid fa-circle-xmark"></i>失敗しました
+                        </div>
+                        <div className="font-mono break-all">{restoreResult.error}</div>
+                      </div>
+                    ) : (
+                      <div className="bg-emerald-50 rounded-xl px-3 py-2.5 text-xs text-emerald-700 leading-relaxed">
+                        <div className="font-semibold flex items-center gap-1.5 mb-0.5">
+                          <i className="fa-solid fa-circle-check"></i>完了
+                        </div>
+                        <div>
+                          {restoreResult.added}件を追加
+                          {restoreResult.skipped > 0 && ` / ${restoreResult.skipped}件は既にこの端末にあるため変更せず`}
+                        </div>
+                      </div>
+                    )
+                  )}
+                </div>
+
+                {/* アプリ情報 */}
+                <div className="bg-white rounded-2xl shadow-sm p-4">
+                  <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5 mb-2">
+                    <i className="fa-solid fa-circle-info text-blue-400"></i>
+                    アプリについて
+                  </h2>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    裁量労働制向け勤務・活動記録アプリ。<br />
+                    週30時間（1日7.5時間）のみなし労働制で働く短時間正社員向けの勤怠管理ツールです。<br /><br />
+                    記録データはブラウザの <code className="bg-slate-100 px-1 rounded">localStorage</code> に保存されます。
+                    バックアップはGASのスプレッドシートで管理されます。
+                  </p>
+                </div>
+              </div>
+            )}
+
+          </div>{/* /main */}
+        </div>
+      );
+    }
+
+    /* ============================================================
+       Mount
+    ============================================================ */
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

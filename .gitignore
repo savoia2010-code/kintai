@@ -1,0 +1,5 @@
+# clasp のプロジェクト設定（scriptId とローカルパスを含むため公開しない）
+gas/.clasp.json
+
+# Claude Code のローカル設定
+.claude/
