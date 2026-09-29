@@ -148,6 +148,72 @@
     }
 
     // 今日が属する○月度を YYYY-MM で返す (GAS getSheetName と同ルール)
+    /** 'YYYY-MM' を n か月ずらす */
+    function shiftMonth(ym, n) {
+      const [y, m] = ym.split('-').map(Number);
+      const t = y * 12 + (m - 1) + n;
+      return `${Math.floor(t / 12)}-${pad(t % 12 + 1)}`;
+    }
+
+    /** 日付 'YYYY-MM-DD' → その日が属する ○月度（26日以降は翌月度） */
+    function toReportMonth(date) {
+      const [y, m, d] = date.split('-').map(Number);
+      return d >= 26 ? shiftMonth(`${y}-${pad(m)}`, 1) : `${y}-${pad(m)}`;
+    }
+
+    function formatReportMonth(ym) {
+      const [y, m] = ym.split('-');
+      return `${y}年${parseInt(m)}月度 ${formatPeriodLabel(ym)}`;
+    }
+
+    /** スプレッドシートの記録をローカルへ反映（スプレッドシート側を正とする。未送信の日付は触らない） */
+    function mergeRemote(local, remote, pending) {
+      const remoteByDate = new Map(remote.filter(r => r.date && !pending[r.date]).map(r => [r.date, r]));
+      let updated = 0;
+      const merged = local.map(e => {
+        const r = remoteByDate.get(e.date);
+        if (!r) return e;
+        remoteByDate.delete(e.date);
+        const same = SYNC_FIELDS.every(k => String(e[k] ?? '') === String(r[k] ?? ''));
+        if (same) return e;
+        updated++;
+        return { ...e, ...r, id: e.id };
+      });
+      const now   = Date.now();
+      const added = [...remoteByDate.values()].map((r, i) => ({ ...r, id: now + i }));
+      return {
+        entries: [...merged, ...added].sort((a, b) => a.date.localeCompare(b.date)),
+        added: added.length, updated,
+      };
+    }
+
+    /** 対象月の選択（◀ ▶ とプルダウン） */
+    function MonthSelect({ value, onChange, months = [] }) {
+      const current = getCurrentReportMonth();
+      let start = shiftMonth(current, -12);
+      let end   = shiftMonth(current, 1);
+      [...months, value].forEach(m => { if (m < start) start = m; if (m > end) end = m; });
+      const list = [];
+      for (let m = end; m >= start; m = shiftMonth(m, -1)) list.push(m);
+      const btn = 'shrink-0 w-10 h-10 rounded-xl border border-slate-200 bg-slate-50 text-slate-500 hover:bg-slate-100 active:bg-slate-200 transition-colors';
+      return (
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => onChange(shiftMonth(value, -1))} className={btn} aria-label="前の月度">
+            <i className="fa-solid fa-chevron-left"></i>
+          </button>
+          <select value={value} onChange={e => onChange(e.target.value)}
+            className="flex-1 min-w-0 border border-slate-200 bg-slate-50 rounded-xl px-2 py-2.5 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors">
+            {list.map(m => (
+              <option key={m} value={m}>{formatReportMonth(m)}{m === current ? ' ★' : ''}</option>
+            ))}
+          </select>
+          <button type="button" onClick={() => onChange(shiftMonth(value, 1))} className={btn} aria-label="次の月度">
+            <i className="fa-solid fa-chevron-right"></i>
+          </button>
+        </div>
+      );
+    }
+
     function getCurrentReportMonth() {
       const d = new Date();
       let y = d.getFullYear(), m = d.getMonth() + 1;
@@ -162,6 +228,8 @@
     const DELIVERABLE_ICONS = { '動画': '🎬', 'アプリ': '📱', '画像': '🖼️', 'その他': '📎' };
     const SENT_IMAGES_KEY   = 'kintai_v1_sent_images';
     const ACCESS_KEY_KEY    = 'kintai_v1_access_key';
+    const PENDING_KEY       = 'kintai_v1_pending';   // { 日付: 'save:…' | 'delete:…' } GASへ未送信の変更
+    const SYNC_FIELDS       = ['category', 'startTime', 'endTime', 'breakTime', 'actualMins', 'deemedMins', 'overtime', 'location', 'notes'];
 
     /** 重複判定キー: ファイル名 + サイズ */
     const fileKey = f => `${f.name}|${f.size}`;
@@ -269,18 +337,27 @@
       const [gasUrl,           setGasUrl]           = useState(() => {
         try { return localStorage.getItem(GAS_URL_KEY) || ''; } catch { return ''; }
       });
-      const [restoring,        setRestoring]        = useState(false);
-      const [restoreResult,    setRestoreResult]    = useState(null); // { added, skipped } | { error }
+      const [pending,          setPending]          = useState(() => {
+        try { return JSON.parse(localStorage.getItem(PENDING_KEY) || '{}'); } catch { return {}; }
+      });
+      const [syncing,          setSyncing]          = useState(false);
+      const [lastSync,         setLastSync]         = useState(null); // { at, added, updated, pushed } | { at, error }
       const [backupResult,     setBackupResult]     = useState(null); // { entries, deliverables, tasks, conn } | { error }
       const [backupWithConn,   setBackupWithConn]   = useState(false); // 接続設定（URL・合言葉）も書き出すか
 
       const pdfRef    = useRef(null);
       const imageRef  = useRef(null);
       const backupRef = useRef(null);
+      const entriesRef = useRef(entries);
+      const pendingRef = useRef(pending);
+      const syncingRef = useRef(false);
+      const lastSyncAt = useRef(0);
+      const syncFnRef  = useRef(null);
       const dragDepth = useRef(0);
 
       /* ---------- Persist entries ---------- */
       useEffect(() => {
+        entriesRef.current = entries;
         localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
       }, [entries]);
 
@@ -349,6 +426,9 @@
         const entry = { ...form, location, notes: selectedTasks.join(', '), actualMins, deemedMins, id: editingId || Date.now() };
 
         if (editingId) {
+          // 日付を変えて更新した場合は、元の日付の行をスプレッドシートから消す
+          const original = entries.find(e => e.id === editingId);
+          if (original && original.date !== entry.date) pushRecord('delete', { action: 'deleteRecord', date: original.date });
           setEntries(prev => prev.map(e => e.id === editingId ? entry : e));
           showToast('記録を更新しました');
           setEditingId(null);
@@ -364,7 +444,7 @@
           // 次の日付へ進め、他の値は保持
           setForm(prev => ({ ...prev, date: advanceDate(prev.date) }));
         }
-        syncToGAS({ action: 'saveRecord', ...entry });
+        pushRecord('save', { action: 'saveRecord', ...entry });
       };
 
       const editEntry = (entry) => {
@@ -392,7 +472,7 @@
         setEntries(prev => prev.filter(e => e.id !== deleteModal));
         setDeleteModal(null);
         showToast('記録を削除しました');
-        if (target) syncToGAS({ action: 'deleteRecord', date: target.date });
+        if (target) pushRecord('delete', { action: 'deleteRecord', date: target.date });
       };
 
       /* ---------- GAS 共通送信 ---------- */
@@ -419,10 +499,31 @@
         return json;
       };
 
-      /** 記録の保存・削除の同期（結果は待たない。未設定なら黙ってローカルのみ） */
-      const syncToGAS = (payload) => {
+      /* ---------- 未送信の変更の管理 ---------- */
+      const updatePending = (fn) => {
+        const next = fn({ ...pendingRef.current });
+        pendingRef.current = next;
+        setPending(next);
+        try { localStorage.setItem(PENDING_KEY, JSON.stringify(next)); } catch {}
+      };
+      const markPending = (date, op) => {
+        const token = `${op}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
+        updatePending(p => ({ ...p, [date]: token }));
+        return token;
+      };
+      /** 送信中に同じ日付が再編集されていたら消さない */
+      const clearPending = (date, token) => updatePending(p => {
+        if (p[date] === token) delete p[date];
+        return p;
+      });
+
+      /** 記録の保存・削除をスプレッドシートへ送る（結果は待たない。失敗・未設定なら未送信として残し、次の同期で再送） */
+      const pushRecord = (op, payload) => {
+        const token = markPending(payload.date, op);
         if (!gasConfigured()) return;
-        gasPost(payload).catch(err => showToast(`GAS同期に失敗: ${err.message}`, 'error'));
+        gasPost(payload)
+          .then(() => clearPending(payload.date, token))
+          .catch(err => showToast(`スプレッドシートへの送信に失敗（次の同期で再送します）: ${err.message}`, 'error'));
       };
 
       /* ---------- GAS 接続設定（この端末のブラウザにのみ保存） ---------- */
@@ -489,15 +590,28 @@
         }
       };
 
-      /* ---------- GASから復元（既存のローカル記録は変更しない） ---------- */
+      /* ---------- スプレッドシートと同期（未送信分を送ってから、スプレッドシートの内容を反映） ---------- */
+      const syncWithGAS = async ({ silent = false } = {}) => {
+        if (syncingRef.current) return;
+        if (!gasConfigured()) { if (!silent) gasReady(); return; }
 
-      const restoreFromGAS = async () => {
-        if (restoring) return;
-        if (!gasReady()) return;
-
-        setRestoring(true);
-        setRestoreResult(null);
+        syncingRef.current = true;
+        setSyncing(true);
         try {
+          // 1) この端末の未送信分を先に送る
+          let pushed = 0;
+          for (const [date, token] of Object.entries(pendingRef.current)) {
+            if (token.startsWith('delete:')) {
+              await gasPost({ action: 'deleteRecord', date });
+            } else {
+              const e = entriesRef.current.find(x => x.date === date);
+              if (e) await gasPost({ action: 'saveRecord', ...e });
+            }
+            clearPending(date, token);
+            pushed++;
+          }
+
+          // 2) スプレッドシートの内容を取得して反映
           const url = `${gasUrl.trim()}?action=getRecords&key=${encodeURIComponent(accessKey.trim())}`;
           const res = await fetch(url, { method: 'GET', redirect: 'follow' });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -505,25 +619,40 @@
           if (json.status !== 'ok') throw new Error(json.message || '取得に失敗しました');
 
           const remote = Array.isArray(json.entries) ? json.entries : [];
-          const known  = new Set(entries.map(e => e.date));
-          const added  = remote
-            .filter(r => r.date && !known.has(r.date))
-            .map((r, i) => ({ ...r, id: Date.now() + i }));
-          const skipped = remote.length - added.length;
-
-          if (added.length > 0) {
-            setEntries(prev => [...prev, ...added].sort((a, b) => a.date.localeCompare(b.date)));
+          const result = mergeRemote(entriesRef.current, remote, pendingRef.current);
+          if (result.added > 0 || result.updated > 0) {
+            entriesRef.current = result.entries;
+            setEntries(result.entries);
           }
-          setRestoreResult({ added: added.length, skipped });
-          showToast(added.length > 0 ? `${added.length}件を復元しました` : '新しい記録はありませんでした',
-                    added.length > 0 ? 'success' : 'info');
+          setLastSync({ at: new Date(), added: result.added, updated: result.updated, pushed });
+          const changed = result.added + result.updated;
+          if (changed > 0) {
+            showToast(`スプレッドシートから${changed}件を反映しました`);
+          } else if (!silent) {
+            showToast('最新の状態です', 'info');
+          }
         } catch (err) {
-          setRestoreResult({ error: String(err.message || err) });
-          showToast('復元に失敗しました', 'error');
+          setLastSync({ at: new Date(), error: String(err.message || err) });
+          if (!silent) showToast(`同期に失敗しました: ${err.message || err}`, 'error');
         } finally {
-          setRestoring(false);
+          lastSyncAt.current = Date.now();
+          syncingRef.current = false;
+          setSyncing(false);
         }
       };
+      syncFnRef.current = syncWithGAS;
+
+      /* 起動時と、アプリに戻ってきたとき（30秒以上空いたら）に自動同期 */
+      useEffect(() => {
+        syncFnRef.current({ silent: true });
+        const onVisible = () => {
+          if (document.visibilityState === 'visible' && Date.now() - lastSyncAt.current > 30000) {
+            syncFnRef.current({ silent: true });
+          }
+        };
+        document.addEventListener('visibilitychange', onVisible);
+        return () => document.removeEventListener('visibilitychange', onVisible);
+      }, []);
 
       /* ---------- Chatwork 報告（GAS経由） ---------- */
       const sendChatwork = async (type) => {
@@ -867,7 +996,18 @@
                 <i className="fa-regular fa-calendar-check text-blue-500 text-lg"></i>
                 勤務・活動記録
               </h1>
-              <span className="text-xs text-slate-400 tabular-nums">{getNow().date}</span>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-slate-400 tabular-nums">{getNow().date}</span>
+                {gasConfigured() && (
+                  <button onClick={() => syncWithGAS()} disabled={syncing}
+                    title={lastSync?.error ? `同期に失敗: ${lastSync.error}` : 'スプレッドシートと同期'}
+                    className={`w-8 h-8 -mr-1 rounded-full flex items-center justify-center transition-colors hover:bg-slate-100 ${
+                      lastSync?.error ? 'text-red-400' : Object.keys(pending).length > 0 ? 'text-amber-500' : 'text-slate-400'
+                    }`}>
+                    <i className={`fa-solid fa-rotate ${syncing ? 'fa-spin' : ''}`}></i>
+                  </button>
+                )}
+              </div>
             </div>
             <nav className="flex">
               {TABS.map(t => (
@@ -1142,9 +1282,8 @@
                 <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-500 mb-1.5">対象月 <span className="font-normal text-slate-400">（前月26日〜当月25日締め）</span></label>
-                    <input type="month" value={reportMonth}
-                      onChange={e => setReportMonth(e.target.value)}
-                      className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors" />
+                    <MonthSelect value={reportMonth} onChange={setReportMonth}
+                      months={entries.map(e => toReportMonth(e.date))} />
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     <button onClick={exportPDF}
@@ -1257,9 +1396,8 @@
                     <i className="fa-solid fa-calendar-days text-blue-400"></i>
                     対象月 <span className="font-normal normal-case text-slate-400">（前月26日〜当月25日締め）</span>
                   </h2>
-                  <input type="month" value={deliverableMonth}
-                    onChange={e => setDeliverableMonth(e.target.value)}
-                    className="w-full border border-slate-200 bg-slate-50 rounded-xl px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:bg-white transition-colors" />
+                  <MonthSelect value={deliverableMonth} onChange={setDeliverableMonth}
+                    months={[...entries.map(e => toReportMonth(e.date)), ...deliverables.map(d => d.month).filter(Boolean)]} />
                   <button onClick={sendMonthlySummary}
                     className="w-full bg-teal-500 hover:bg-teal-600 active:bg-teal-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-teal-100 flex items-center justify-center gap-2">
                     <i className="fa-solid fa-paper-plane"></i>月次報告をChatworkへ送信
@@ -1571,43 +1709,51 @@
                   )}
                 </div>
 
-                {/* GASから復元 */}
+                {/* スプレッドシートと同期 */}
                 <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
                   <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
-                    <i className="fa-solid fa-cloud-arrow-down text-indigo-400"></i>
-                    GASから復元
+                    <i className="fa-solid fa-rotate text-indigo-400"></i>
+                    スプレッドシートと同期
                   </h2>
                   <p className="text-xs text-slate-500 leading-relaxed">
-                    別の端末で入力した記録をスプレッドシートから取り込みます。
-                    <span className="font-semibold text-slate-600">この端末に既にある日付は変更しません。</span>
+                    アプリを開いたときと、アプリに戻ってきたときに自動で同期します。ほかの端末で入力・修正した記録も反映されます。
+                    <span className="font-semibold text-slate-600">同じ日付はスプレッドシート側の内容に合わせます。</span>
+                    この端末でまだ送れていない記録は、先に送ってから反映します。
                   </p>
-                  <button onClick={restoreFromGAS} disabled={restoring}
+                  <button onClick={() => syncWithGAS()} disabled={syncing}
                     className={`w-full text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-indigo-100 flex items-center justify-center gap-2 ${
-                      restoring ? 'bg-indigo-300 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700'
+                      syncing ? 'bg-indigo-300 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600 active:bg-indigo-700'
                     }`}>
-                    {restoring ? (
-                      <><i className="fa-solid fa-spinner fa-spin"></i>取得中...</>
+                    {syncing ? (
+                      <><i className="fa-solid fa-spinner fa-spin"></i>同期中...</>
                     ) : (
-                      <><i className="fa-solid fa-cloud-arrow-down"></i>GASから復元する</>
+                      <><i className="fa-solid fa-rotate"></i>今すぐ同期</>
                     )}
                   </button>
 
-                  {restoreResult && (
-                    restoreResult.error ? (
+                  {Object.keys(pending).length > 0 && (
+                    <div className="bg-amber-50 rounded-xl px-3 py-2.5 text-xs text-amber-700 leading-relaxed">
+                      <i className="fa-solid fa-clock mr-1"></i>
+                      スプレッドシートへ未送信の記録が {Object.keys(pending).length} 件あります（次の同期で送信します）
+                    </div>
+                  )}
+
+                  {lastSync && (
+                    lastSync.error ? (
                       <div className="bg-red-50 rounded-xl px-3 py-2.5 text-xs text-red-600 leading-relaxed">
                         <div className="font-semibold flex items-center gap-1.5 mb-0.5">
-                          <i className="fa-solid fa-circle-xmark"></i>失敗しました
+                          <i className="fa-solid fa-circle-xmark"></i>同期に失敗しました（{lastSync.at.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}）
                         </div>
-                        <div className="font-mono break-all">{restoreResult.error}</div>
+                        <div className="font-mono break-all">{lastSync.error}</div>
                       </div>
                     ) : (
                       <div className="bg-emerald-50 rounded-xl px-3 py-2.5 text-xs text-emerald-700 leading-relaxed">
                         <div className="font-semibold flex items-center gap-1.5 mb-0.5">
-                          <i className="fa-solid fa-circle-check"></i>完了
+                          <i className="fa-solid fa-circle-check"></i>同期しました（{lastSync.at.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}）
                         </div>
                         <div>
-                          {restoreResult.added}件を追加
-                          {restoreResult.skipped > 0 && ` / ${restoreResult.skipped}件は既にこの端末にあるため変更せず`}
+                          追加 {lastSync.added}件 / 更新 {lastSync.updated}件
+                          {lastSync.pushed > 0 && ` / 未送信分 ${lastSync.pushed}件を送信`}
                         </div>
                       </div>
                     )
