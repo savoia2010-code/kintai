@@ -166,11 +166,18 @@
       return `${y}年${parseInt(m)}月度 ${formatPeriodLabel(ym)}`;
     }
 
-    /** スプレッドシートの記録をローカルへ反映（スプレッドシート側を正とする。未送信の日付は触らない） */
-    function mergeRemote(local, remote, pending) {
+    /**
+     * スプレッドシートの記録をローカルへ反映（スプレッドシート側を正とする。未送信の日付は触らない）
+     * deleted: 他の端末で削除された日付。スプレッドシートに記録が無い場合だけ、この端末からも消す
+     */
+    function mergeRemote(local, remote, pending, deleted = []) {
       const remoteByDate = new Map(remote.filter(r => r.date && !pending[r.date]).map(r => [r.date, r]));
+      const remoteDates  = new Set(remote.map(r => r.date));
+      const deletedSet   = new Set(deleted.filter(d => !pending[d] && !remoteDates.has(d)));
+      const kept         = local.filter(e => !deletedSet.has(e.date));
+      const removed      = local.length - kept.length;
       let updated = 0;
-      const merged = local.map(e => {
+      const merged = kept.map(e => {
         const r = remoteByDate.get(e.date);
         if (!r) return e;
         remoteByDate.delete(e.date);
@@ -183,7 +190,7 @@
       const added = [...remoteByDate.values()].map((r, i) => ({ ...r, id: now + i }));
       return {
         entries: [...merged, ...added].sort((a, b) => a.date.localeCompare(b.date)),
-        added: added.length, updated,
+        added: added.length, updated, removed,
       };
     }
 
@@ -618,14 +625,15 @@
           const json = await res.json();
           if (json.status !== 'ok') throw new Error(json.message || '取得に失敗しました');
 
-          const remote = Array.isArray(json.entries) ? json.entries : [];
-          const result = mergeRemote(entriesRef.current, remote, pendingRef.current);
-          if (result.added > 0 || result.updated > 0) {
+          const remote  = Array.isArray(json.entries) ? json.entries : [];
+          const deleted = Array.isArray(json.deleted) ? json.deleted : [];
+          const result  = mergeRemote(entriesRef.current, remote, pendingRef.current, deleted);
+          const changed = result.added + result.updated + result.removed;
+          if (changed > 0) {
             entriesRef.current = result.entries;
             setEntries(result.entries);
           }
-          setLastSync({ at: new Date(), added: result.added, updated: result.updated, pushed });
-          const changed = result.added + result.updated;
+          setLastSync({ at: new Date(), added: result.added, updated: result.updated, removed: result.removed, pushed });
           if (changed > 0) {
             showToast(`スプレッドシートから${changed}件を反映しました`);
           } else if (!silent) {
@@ -1716,7 +1724,7 @@
                     スプレッドシートと同期
                   </h2>
                   <p className="text-xs text-slate-500 leading-relaxed">
-                    アプリを開いたときと、アプリに戻ってきたときに自動で同期します。ほかの端末で入力・修正した記録も反映されます。
+                    アプリを開いたときと、アプリに戻ってきたときに自動で同期します。ほかの端末で入力・修正・削除した記録も反映されます。
                     <span className="font-semibold text-slate-600">同じ日付はスプレッドシート側の内容に合わせます。</span>
                     この端末でまだ送れていない記録は、先に送ってから反映します。
                   </p>
@@ -1752,7 +1760,7 @@
                           <i className="fa-solid fa-circle-check"></i>同期しました（{lastSync.at.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}）
                         </div>
                         <div>
-                          追加 {lastSync.added}件 / 更新 {lastSync.updated}件
+                          追加 {lastSync.added}件 / 更新 {lastSync.updated}件 / 削除 {lastSync.removed}件
                           {lastSync.pushed > 0 && ` / 未送信分 ${lastSync.pushed}件を送信`}
                         </div>
                       </div>

@@ -7,6 +7,7 @@
  *   CHATWORK_TOKEN   : Chatwork APIトークン
  *   CHATWORK_ROOM_ID : Chatwork 送信先ルームID
  *   ACCESS_KEY       : アプリからの読み書きに必要な合言葉（doGet / doPost 共通）
+ *   DELETED_DATES    : （自動管理・手で編集しない）アプリで削除した日付の記録。他の端末に削除を伝えるために使う
  *
  * シート命名規則: {WORKER_NAME}/{YY}/{MM}
  *   例: 山田/26/03
@@ -350,12 +351,20 @@ function saveRecord(data) {
   if (data.category === '年休' || data.category === '欠勤') {
     sheet.getRange(row, 3, 1, 6).clearContent(); // C〜H
   }
+
+  // 削除済みの日付に入力し直した場合は、削除記録を取り消す
+  if (getDeletedDates()[data.date]) {
+    updateDeletedDates(map => { delete map[data.date]; return map; });
+  }
 }
 
 /**
  * 記録の削除（B〜K列クリア、A列の日付は保持）
  */
 function deleteRecord(data) {
+  // 他の端末に削除を伝えるため、行の有無にかかわらず削除した日付を記録する
+  updateDeletedDates(map => { map[data.date] = Date.now(); return map; });
+
   const sheetName = getSheetName(data.date);
   const sheet     = getSpreadsheet().getSheetByName(sheetName);
   if (!sheet) return;
@@ -364,6 +373,33 @@ function deleteRecord(data) {
   if (row < 0) return;
 
   sheet.getRange(row, 2, 1, 9).clearContent(); // B〜J列
+}
+
+// ============================================================
+// 削除した日付の記録（スクリプトプロパティ DELETED_DATES）
+// ============================================================
+
+/** { 'YYYY-MM-DD': 削除時刻(ms) } */
+function getDeletedDates() {
+  try {
+    return JSON.parse(PropertiesService.getScriptProperties().getProperty('DELETED_DATES') || '{}');
+  } catch (err) {
+    return {};
+  }
+}
+
+/** 同時に書き換えて記録が消えないようロックを取って更新する。400日より古い記録は捨てる */
+function updateDeletedDates(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const map    = fn(getDeletedDates());
+    const cutoff = Date.now() - 400 * 24 * 60 * 60 * 1000;
+    Object.keys(map).forEach(d => { if (map[d] < cutoff) delete map[d]; });
+    PropertiesService.getScriptProperties().setProperty('DELETED_DATES', JSON.stringify(map));
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // ============================================================
@@ -386,7 +422,7 @@ function doGet(e) {
 
     const action = params.action || 'getRecords';
     if (action === 'getRecords') {
-      return respond({ status: 'ok', entries: getRecords(params.month) });
+      return respond({ status: 'ok', entries: getRecords(params.month), deleted: Object.keys(getDeletedDates()) });
     }
     throw new Error('不明なアクション: ' + action);
 
