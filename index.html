@@ -496,6 +496,7 @@
       const [timeline,         setTimeline]         = useState(null);  // { visits, coveredDates, fileName } メモリ上だけ
       const [timelineError,    setTimelineError]    = useState(null);
       const [choosingOffice,   setChoosingOffice]   = useState(false);
+      const [returnToList,     setReturnToList]     = useState(false); // 照合パネルから開いたとき、保存後に一覧へ戻る
       const timelineRef = useRef(null);
 
       const pdfRef    = useRef(null);
@@ -598,7 +599,19 @@
           setForm(prev => ({ ...prev, date: advanceDate(prev.date) }));
         }
         pushRecord('save', { action: 'saveRecord', ...entry });
+        if (returnToList) backToList();
       };
+
+      /** 照合パネルから開いた入力を終えて、一覧（照合パネル）へ戻る */
+      const backToList = () => {
+        setReturnToList(false);
+        resetForm();
+        setTab('list');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      };
+
+      // 照合パネル以外へ移ったら、戻る指定は取り消す
+      useEffect(() => { if (tab !== 'input') setReturnToList(false); }, [tab]);
 
       const editEntry = (entry) => {
         setForm({
@@ -653,6 +666,7 @@
           setTab('input');
           window.scrollTo({ top: 0, behavior: 'smooth' });
         }
+        setReturnToList(true);
         showToast('候補をフォームに入れました。確認して保存してください');
       };
 
@@ -1359,13 +1373,19 @@
                   )}
 
                   {/* 保存 / リセット */}
+                  {returnToList && (
+                    <p className="text-[11px] text-blue-600 text-center">
+                      <i className="fa-solid fa-map-location-dot mr-1"></i>
+                      照合から開いています。保存すると一覧に戻ります（↺ で取りやめて戻る）
+                    </p>
+                  )}
                   <div className="flex gap-2 pt-1">
                     <button onClick={saveEntry}
                       className="flex-1 bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white font-bold py-3 rounded-xl transition-colors shadow-sm shadow-blue-200">
                       <i className="fa-solid fa-floppy-disk mr-2"></i>
                       {editingId ? '更新する' : '保存する'}
                     </button>
-                    <button onClick={resetForm}
+                    <button onClick={returnToList ? backToList : resetForm}
                       className="w-12 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-600 font-bold py-3 rounded-xl transition-colors"
                       title="リセット">
                       <i className="fa-solid fa-arrow-rotate-left"></i>
@@ -1408,7 +1428,7 @@
                   onPickFile={() => timelineRef.current && timelineRef.current.click()}
                   choosingOffice={choosingOffice} setChoosingOffice={setChoosingOffice}
                   saveOffice={saveOffice} onApply={applySuggestion}
-                  onEdit={e => editEntry(entries.find(x => x.id === e.id) || e)} />
+                  onEdit={e => { editEntry(entries.find(x => x.id === e.id) || e); setReturnToList(true); }} />
                 {entries.length === 0 ? (
                   <div className="text-center py-20 text-slate-400">
                     <i className="fa-regular fa-folder-open text-5xl mb-4 block"></i>
