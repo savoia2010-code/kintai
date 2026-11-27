@@ -138,7 +138,67 @@
     }).filter(Boolean);
   }
 
-  var api = { planPunch: planPunch, comparePunches: comparePunches, punchMs: punchMs,
+  /**
+   * ショートカットの到着・出発（会社に着いた／離れた）を、その日の始業・終業に反映する。
+   * 会社への到着・出発なので、反映するのは出社の日だけになる。
+   * - 記録なし → 出勤（土日は休日出勤）・出社で新しく作る
+   * - 記録あり → 始業・終業が「空欄」か「前回ここで自動で入れた値のまま」のときだけ書き換える
+   *   （開始・終了ボタンや手で入れた時刻は変えない。昼の外出のあと最後の出発で終業を更新できる）
+   * - 年休・欠勤の日は変えない
+   * @param {object} p { entries, punches, range: {from, to}, marks: { [date]: {startTime, endTime} } }
+   * @returns {{ changes: [{ entry, isNew, fields: string[] }], marks }} marks は更新後の「自動で入れた値」
+   */
+  function planArrivals(p) {
+    var range = p.range;
+    var byDate = {};
+    (p.punches || []).forEach(function (pu) {
+      if (!pu || (pu.type !== 'arrive' && pu.type !== 'leave')) return;
+      if (!pu.date || pu.date < range.from || pu.date > range.to) return;
+      var ms = punchMs(pu);
+      if (!isFinite(ms)) return;
+      var t = jstTime(ms);
+      var key = t < '05:00' ? '1' + t : '0' + t;
+      var d = byDate[pu.date] = byDate[pu.date] || {};
+      if (pu.type === 'arrive') { if (!d.arrive || key < d.arrive.key) d.arrive = { key: key, time: t }; }
+      else if (!d.leave || key > d.leave.key) d.leave = { key: key, time: t };
+    });
+    var entryByDate = {};
+    (p.entries || []).forEach(function (e) { if (e && e.date) entryByDate[e.date] = e; });
+    var marks = Object.assign({}, p.marks || {});
+    var changes = [];
+
+    Object.keys(byDate).sort().forEach(function (date) {
+      var d = byDate[date];
+      var A = d.arrive ? snapToHalfHour(d.arrive.time) : '';
+      var L = d.leave ? snapToHalfHour(d.leave.time) : '';
+      var existing = entryByDate[date];
+      if (!existing) {
+        changes.push({ isNew: true, fields: [A && 'startTime', L && 'endTime'].filter(Boolean), entry: {
+          date: date, category: isWeekend(date) ? '休日出勤' : '出勤', startTime: A, endTime: L,
+          breakTime: '01:00', overtime: '00:00', location: '出社', notes: '' } });
+        marks[date] = { startTime: A, endTime: L };
+        return;
+      }
+      if (isTimeOff(existing.category)) return;
+      var mark = marks[date] || {};
+      var entry = Object.assign({}, existing);
+      var fields = [];
+      var nextMark = { startTime: mark.startTime || '', endTime: mark.endTime || '' };
+      var canSet = function (cur, prev) { return !cur || (prev && cur === prev); };
+      if (A && A !== entry.startTime && canSet(entry.startTime, mark.startTime)) {
+        entry.startTime = A; nextMark.startTime = A; fields.push('startTime');
+      }
+      if (L && L !== entry.endTime && canSet(entry.endTime, mark.endTime)) {
+        entry.endTime = L; nextMark.endTime = L; fields.push('endTime');
+      }
+      if (fields.length === 0) return;
+      marks[date] = nextMark;
+      changes.push({ isNew: false, fields: fields, entry: entry });
+    });
+    return { changes: changes, marks: marks };
+  }
+
+  var api = { planPunch: planPunch, comparePunches: comparePunches, planArrivals: planArrivals, punchMs: punchMs,
               snapToHalfHour: snapToHalfHour, jstDate: jstDate, jstTime: jstTime };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.KintaiPunch = api;

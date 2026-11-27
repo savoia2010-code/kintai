@@ -104,3 +104,57 @@ test('comparePunches: 一致・差分・記録なし・年休・範囲外・到�
   assert.equal(none[0].status, 'suggestNew');
   assert.deepEqual(none[0].suggestion, { category: '出勤', startTime: '09:00', endTime: '18:00' });
 });
+
+const arr = (date, type, hm) => ({ date, type, clientTime: '', receivedAt: `${date} ${hm}:00`, source: 'shortcut' });
+const R = { from: '2026-10-26', to: '2026-11-25' };
+
+test('planArrivals: 記録なしの日は出勤・出社で作る（土日は休日出勤）', () => {
+  const r = P.planArrivals({ entries: [], range: R, marks: {}, punches: [
+    arr('2026-11-02', 'arrive', '09:12'), arr('2026-11-02', 'leave', '12:05'),
+    arr('2026-11-02', 'arrive', '13:01'), arr('2026-11-02', 'leave', '18:20'),
+    arr('2026-11-07', 'arrive', '10:40'),
+  ] });
+  assert.equal(r.changes.length, 2);
+  assert.deepEqual(r.changes[0].entry, { date: '2026-11-02', category: '出勤', startTime: '09:00', endTime: '18:00',
+    breakTime: '01:00', overtime: '00:00', location: '出社', notes: '' });
+  assert.equal(r.changes[1].entry.category, '休日出勤');
+  assert.equal(r.changes[1].entry.endTime, '');
+  assert.deepEqual(r.marks['2026-11-02'], { startTime: '09:00', endTime: '18:00' });
+});
+
+test('planArrivals: ボタンや手で入れた時刻は変えず、空欄だけ埋める', () => {
+  const r = P.planArrivals({ range: R, marks: {},
+    entries: [E('2026-11-02', '出勤', '出社', '08:30', '')],
+    punches: [arr('2026-11-02', 'arrive', '09:12'), arr('2026-11-02', 'leave', '18:20')] });
+  assert.deepEqual(r.changes[0].fields, ['endTime']);
+  assert.equal(r.changes[0].entry.startTime, '08:30');
+  assert.equal(r.changes[0].entry.endTime, '18:00');
+});
+
+test('planArrivals: 昼の外出で入った終業は、最後の出発で更新する。手で直した後は変えない', () => {
+  const first = P.planArrivals({ entries: [], range: R, marks: {},
+    punches: [arr('2026-11-02', 'arrive', '09:12'), arr('2026-11-02', 'leave', '12:05')] });
+  const saved = { ...first.changes[0].entry, id: 1 };
+  assert.equal(saved.endTime, '12:00');
+  const later = [arr('2026-11-02', 'arrive', '09:12'), arr('2026-11-02', 'leave', '12:05'),
+                 arr('2026-11-02', 'arrive', '13:00'), arr('2026-11-02', 'leave', '18:40')];
+  const second = P.planArrivals({ entries: [saved], range: R, marks: first.marks, punches: later });
+  assert.deepEqual(second.changes[0].fields, ['endTime']);
+  assert.equal(second.changes[0].entry.endTime, '18:30');
+  // 同じ内容でもう一度: 変化なし
+  const again = P.planArrivals({ entries: [second.changes[0].entry], range: R, marks: second.marks, punches: later });
+  assert.equal(again.changes.length, 0);
+  // 手で 19:00 に直した後は変えない
+  const edited = { ...second.changes[0].entry, endTime: '19:00' };
+  const after = P.planArrivals({ entries: [edited], range: R, marks: second.marks,
+    punches: [...later, arr('2026-11-02', 'leave', '20:10')] });
+  assert.equal(after.changes.length, 0);
+});
+
+test('planArrivals: 年休の日・範囲外・開始終了の打刻は使わない', () => {
+  const r = P.planArrivals({ range: R, marks: {},
+    entries: [E('2026-11-02', '年休', '', '', '')],
+    punches: [arr('2026-11-02', 'arrive', '09:00'), arr('2026-11-26', 'arrive', '09:00'),
+              { date: '2026-11-03', type: 'start', clientTime: '2026-11-03T09:00:00+09:00' }] });
+  assert.equal(r.changes.length, 0);
+});
