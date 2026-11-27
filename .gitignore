@@ -3,3 +3,13 @@ gas/.clasp.json
 
 # Claude Code のローカル設定
 .claude/
+
+# 位置履歴などの個人データ（タイムラインのエクスポート等）。公開リポジトリに載せない
+inport/
+import/
+*.timeline.json
+Timeline.json
+location-history.json
+
+# Mac 移行セット（接続情報やメモリを含むため公開しない）
+_mac移行/
