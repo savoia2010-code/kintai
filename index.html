@@ -18,6 +18,9 @@
   <!-- html2pdf.js -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 
+  <!-- タイムライン照合のロジック（ブラウザ内だけで処理） -->
+  <script src="timeline.js"></script>
+
   <!-- Font Awesome 6 -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 
@@ -235,6 +238,7 @@
     const DELIVERABLE_ICONS = { '動画': '🎬', 'アプリ': '📱', '画像': '🖼️', 'その他': '📎' };
     const SENT_IMAGES_KEY   = 'kintai_v1_sent_images';
     const ACCESS_KEY_KEY    = 'kintai_v1_access_key';
+    const OFFICE_KEY        = 'kintai_v1_office';    // 会社の場所（この端末にだけ保存。GASへは送らない）
     const PENDING_KEY       = 'kintai_v1_pending';   // { 日付: 'save:…' | 'delete:…' } GASへ未送信の変更
     const SYNC_FIELDS       = ['category', 'startTime', 'endTime', 'breakTime', 'actualMins', 'deemedMins', 'overtime', 'location', 'notes'];
 
@@ -310,6 +314,136 @@
     /* ============================================================
        Main App
     ============================================================ */
+
+    /* ============================================================
+       タイムライン照合パネル（一覧タブ）
+       生データはメモリ上だけで扱い、座標は画面に出さない
+    ============================================================ */
+    const MATCH_STYLES = {
+      ok:              { icon: 'fa-solid fa-check',               cls: 'text-emerald-600 bg-emerald-50' },
+      diff:            { icon: 'fa-solid fa-clock',               cls: 'text-amber-700 bg-amber-50'     },
+      suggestLocation: { icon: 'fa-solid fa-building',            cls: 'text-blue-700 bg-blue-50'       },
+      suggestNew:      { icon: 'fa-solid fa-plus',                cls: 'text-blue-700 bg-blue-50'       },
+      missingOffice:   { icon: 'fa-solid fa-triangle-exclamation', cls: 'text-red-600 bg-red-50'        },
+      leaveConflict:   { icon: 'fa-solid fa-triangle-exclamation', cls: 'text-red-600 bg-red-50'        },
+      noData:          { icon: 'fa-solid fa-question',            cls: 'text-slate-400 bg-slate-50'     },
+    };
+
+    function TimelinePanel({ timeline, error, office, entries, month, onMonthChange, months,
+                             onPickFile, choosingOffice, setChoosingOffice, saveOffice, onApply }) {
+      const TL = window.KintaiTimeline;
+      const [hideOk, setHideOk] = useState(true);
+
+      const candidates = (timeline && choosingOffice) ? TL.findOfficeCandidates(timeline.visits) : [];
+      let rows = [];
+      if (timeline && office && !choosingOffice) {
+        const p = getReportPeriod(month);
+        const range = { from: p.startDate, to: p.endDate };
+        const officeDays = TL.summarizeOfficeDays(timeline.visits, office, range);
+        const resolved = entries.map(e => ({ ...e, location: isTimeOff(e.category) ? '' : getLocation(e) }));
+        rows = TL.matchPeriod(resolved, officeDays, timeline.coveredDates, range);
+      }
+      const shown = hideOk ? rows.filter(r => r.status !== 'ok') : rows;
+      const okCount = rows.length - rows.filter(r => r.status !== 'ok').length;
+
+      return (
+        <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+              <i className="fa-solid fa-map-location-dot text-blue-400"></i>
+              タイムライン照合
+            </h2>
+            <button onClick={onPickFile}
+              className="text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 px-3 py-1.5 rounded-lg">
+              <i className="fa-solid fa-file-import mr-1"></i>
+              {timeline ? '別のファイル' : 'ファイルを選ぶ'}
+            </button>
+          </div>
+
+          {!timeline && !error && (
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Google マップのタイムラインの書き出し（JSON）を選ぶと、記録と照らし合わせます。
+              <span className="font-semibold text-slate-600">ファイルはこの画面の中だけで読み、保存も送信もしません。</span>
+            </p>
+          )}
+          {error && <p className="text-xs text-red-600">{error}</p>}
+          {timeline && (
+            <p className="text-[11px] text-slate-400">
+              {timeline.fileName}（滞在 {timeline.visits.length} 件）・再読み込みで消えます
+            </p>
+          )}
+
+          {timeline && choosingOffice && (
+            <div className="space-y-2">
+              <p className="text-xs text-slate-600 font-semibold">会社の場所を選んでください（平日 8〜20 時に長く滞在した場所）</p>
+              {candidates.length === 0 && <p className="text-xs text-slate-400">候補が見つかりません</p>}
+              {candidates.map((c, i) => (
+                <button key={c.key} onClick={() => { saveOffice(c.office); setChoosingOffice(false); }}
+                  className="w-full text-left bg-slate-50 hover:bg-blue-50 rounded-xl px-3 py-2.5 text-xs text-slate-700">
+                  <span className="font-bold">候補 {i + 1}</span>
+                  ：{c.days} 日・1日平均 {minsToHHMM(c.avgMins)}
+                  <span className="block text-[10px] text-slate-400">{c.firstDate} 〜 {c.lastDate}</span>
+                </button>
+              ))}
+              {office && (
+                <button onClick={() => setChoosingOffice(false)} className="text-xs text-slate-400 underline">
+                  変更しない
+                </button>
+              )}
+            </div>
+          )}
+
+          {timeline && office && !choosingOffice && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <MonthSelect value={month} onChange={onMonthChange} months={months} />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <input type="checkbox" checked={hideOk} onChange={e => setHideOk(e.target.checked)} />
+                  一致した日を隠す（{okCount} 日）
+                </label>
+                <button onClick={() => setChoosingOffice(true)} className="underline">会社の場所を選び直す</button>
+              </div>
+              {shown.length === 0 && (
+                <p className="text-xs text-slate-400 text-center py-3">確認が必要な日はありません</p>
+              )}
+              {shown.map(r => {
+                const st = MATCH_STYLES[r.status] || MATCH_STYLES.noData;
+                const { dn } = makeDayLabel(r.date);
+                return (
+                  <div key={r.date} className={`rounded-xl px-3 py-2 text-xs ${st.cls}`}>
+                    <div className="flex items-start gap-2">
+                      <i className={`${st.icon} mt-0.5`}></i>
+                      <div className="flex-1 min-w-0">
+                        <span className="font-bold tabular-nums">{r.date.slice(5).replace('-', '/')}({dn})</span>
+                        {r.entry && <span className="ml-1.5 opacity-70">{r.entry.category}・{r.entry.location || '—'} {r.entry.startTime}〜{r.entry.endTime}</span>}
+                        <span className="block">{r.message}</span>
+                        {r.officeDay && r.officeDay.outMins > 0 && (
+                          <span className="block opacity-70">外出 {r.officeDay.outMins} 分（会社にいた時間 {minsToHHMM(r.officeDay.inMins)}）</span>
+                        )}
+                      </div>
+                      <div className="flex flex-col gap-1 shrink-0">
+                        {r.suggestion && r.suggestion.locations
+                          ? r.suggestion.locations.map(loc => (
+                              <button key={loc} onClick={() => onApply(r, { location: loc })}
+                                className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">{loc}に</button>
+                            ))
+                          : r.suggestion && (
+                              <button onClick={() => onApply(r)}
+                                className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">反映</button>
+                            )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     function App() {
       /* ---------- State ---------- */
       const [entries,     setEntries]     = useState(() => {
@@ -351,6 +485,13 @@
       const [lastSync,         setLastSync]         = useState(null); // { at, added, updated, pushed } | { at, error }
       const [backupResult,     setBackupResult]     = useState(null); // { entries, deliverables, tasks, conn } | { error }
       const [backupWithConn,   setBackupWithConn]   = useState(false); // 接続設定（URL・合言葉）も書き出すか
+      const [office,           setOffice]           = useState(() => {
+        try { return JSON.parse(localStorage.getItem(OFFICE_KEY) || 'null'); } catch { return null; }
+      });
+      const [timeline,         setTimeline]         = useState(null);  // { visits, coveredDates, fileName } メモリ上だけ
+      const [timelineError,    setTimelineError]    = useState(null);
+      const [choosingOffice,   setChoosingOffice]   = useState(false);
+      const timelineRef = useRef(null);
 
       const pdfRef    = useRef(null);
       const imageRef  = useRef(null);
@@ -473,6 +614,43 @@
         window.scrollTo({ top: 0, behavior: 'smooth' });
       };
 
+      /* ---------- タイムライン照合（生データはメモリ上だけ。保存も送信もしない） ---------- */
+      const saveOffice = (o) => {
+        setOffice(o);
+        try { o ? localStorage.setItem(OFFICE_KEY, JSON.stringify(o)) : localStorage.removeItem(OFFICE_KEY); } catch {}
+      };
+
+      const loadTimeline = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        e.target.value = '';
+        if (!file) return;
+        setTimelineError(null);
+        try {
+          const parsed = window.KintaiTimeline.parseTimeline(JSON.parse(await file.text()));
+          if (parsed.visits.length === 0) throw new Error('滞在（visit）が見つかりません。タイムラインの書き出しファイルか確認してください');
+          setTimeline({ ...parsed, fileName: file.name });
+          if (!office) setChoosingOffice(true);
+        } catch (err) {
+          setTimeline(null);
+          setTimelineError(String(err.message || err));
+        }
+      };
+
+      const applySuggestion = (row, extra = {}) => {
+        const { locations, ...fields } = row.suggestion || {};
+        if (row.entry) {
+          editEntry(row.entry);
+          setForm(prev => ({ ...prev, ...fields, ...extra }));
+        } else {
+          setForm({ ...makeDefaultForm(), date: row.date, ...fields, ...extra });
+          setSelectedTasks([]);
+          setEditingId(null);
+          setTab('input');
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+        showToast('候補をフォームに入れました。確認して保存してください');
+      };
+
       const confirmDelete = (id) => setDeleteModal(id);
       const doDelete = () => {
         const target = entries.find(e => e.id === deleteModal);
@@ -548,6 +726,7 @@
         const data = { app: 'kintai', version: 1, exportedAt: new Date().toISOString(),
                        entries, customTasks, deliverables, sentImageKeys };
         if (backupWithConn) data.connection = { gasUrl: gasUrl.trim(), accessKey: accessKey.trim() };
+        if (backupWithConn && office) data.office = office;
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const url  = URL.createObjectURL(blob);
         const a    = document.createElement('a');
@@ -588,6 +767,10 @@
             if (data.connection.accessKey && !accessKey.trim()) { saveAccessKey(data.connection.accessKey); applied.push('合言葉'); }
             conn = applied.length > 0 ? `${applied.join('・')}を設定しました`
                                       : '接続設定は既に入力済みのため変更していません';
+          }
+          if (data.office && !office) {
+            saveOffice(data.office);
+            conn = (conn ? conn + '。' : '') + '会社の場所を設定しました';
           }
           setBackupResult({ entries: newEntries.length, deliverables: newDelivs.length, tasks: newTasks.length, conn });
           showToast('バックアップを取り込みました');
@@ -1214,6 +1397,12 @@
             {/* -------------------------------------------------- */}
             {tab === 'list' && (
               <div className="space-y-3">
+                <input ref={timelineRef} type="file" accept=".json,application/json" className="hidden" onChange={loadTimeline} />
+                <TimelinePanel timeline={timeline} error={timelineError} office={office} entries={entries}
+                  month={reportMonth} onMonthChange={setReportMonth} months={entries.map(e => toReportMonth(e.date))}
+                  onPickFile={() => timelineRef.current && timelineRef.current.click()}
+                  choosingOffice={choosingOffice} setChoosingOffice={setChoosingOffice}
+                  saveOffice={saveOffice} onApply={applySuggestion} />
                 {entries.length === 0 ? (
                   <div className="text-center py-20 text-slate-400">
                     <i className="fa-regular fa-folder-open text-5xl mb-4 block"></i>
@@ -1680,7 +1869,7 @@
                       onChange={e => setBackupWithConn(e.target.checked)}
                       className="mt-0.5 accent-amber-500" />
                     <span className="text-xs text-slate-600 leading-relaxed">
-                      接続設定（デプロイURL・合言葉）も書き出す
+                      接続設定（デプロイURL・合言葉）と会社の場所も書き出す
                       <span className="block text-[10px] text-slate-400">
                         取り込み先で未入力の項目だけ設定されます。合言葉が入ったファイルになるため、引っ越し後は削除してください。
                       </span>
