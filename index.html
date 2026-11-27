@@ -20,6 +20,8 @@
 
   <!-- タイムライン照合のロジック（ブラウザ内だけで処理） -->
   <script src="timeline.js"></script>
+  <!-- 打刻（開始・終了報告の自動保存と、打刻との照合） -->
+  <script src="punch.js"></script>
 
   <!-- Font Awesome 6 -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
@@ -330,7 +332,7 @@
     };
 
     function TimelinePanel({ timeline, error, office, entries, month, onMonthChange, months,
-                             onPickFile, choosingOffice, setChoosingOffice, saveOffice, onApply, onEdit }) {
+                             onPickFile, choosingOffice, setChoosingOffice, saveOffice, onApply, onEdit, punchData, gasOn }) {
       const TL = window.KintaiTimeline;
       const [hideOk, setHideOk] = useState(true);
 
@@ -343,15 +345,61 @@
         const resolved = entries.map(e => ({ ...e, location: isTimeOff(e.category) ? '' : getLocation(e) }));
         rows = TL.matchPeriod(resolved, officeDays, timeline.coveredDates, range);
       }
+      // 打刻との照合（タイムラインを読み込まなくても使える）
+      let punchRows = [];
+      const punchReady = punchData && punchData.month === month && punchData.punches;
+      if (punchReady) {
+        const p = getReportPeriod(month);
+        punchRows = window.KintaiPunch.comparePunches(entries, punchData.punches, { from: p.startDate, to: p.endDate });
+      }
       const shown = hideOk ? rows.filter(r => r.status !== 'ok') : rows;
       const okCount = rows.length - rows.filter(r => r.status !== 'ok').length;
+      const punchShown = hideOk ? punchRows.filter(r => r.status !== 'ok') : punchRows;
+      const punchOk = punchRows.length - punchRows.filter(r => r.status !== 'ok').length;
+
+      const renderRow = (r, key) => {
+        const st = MATCH_STYLES[r.status] || MATCH_STYLES.noData;
+        const { dn } = makeDayLabel(r.date);
+        return (
+          <div key={key} className={`rounded-xl px-3 py-2 text-xs ${st.cls}`}>
+            <div className="flex items-start gap-2">
+              <i className={`${st.icon} mt-0.5`}></i>
+              <div className="flex-1 min-w-0">
+                <span className="font-bold tabular-nums">{r.date.slice(5).replace('-', '/')}({dn})</span>
+                {r.entry && <span className="ml-1.5 opacity-70">{r.entry.category}・{r.entry.location || '—'} {r.entry.startTime}〜{r.entry.endTime}</span>}
+                <span className="block">{r.message}</span>
+                {r.info && <span className="block opacity-70">{r.info}</span>}
+                {r.officeDay && r.officeDay.outMins > 0 && (
+                  <span className="block opacity-70">外出 {r.officeDay.outMins} 分（会社にいた時間 {minsToHHMM(r.officeDay.inMins)}）</span>
+                )}
+              </div>
+              <div className="flex flex-col gap-1 shrink-0">
+                {r.suggestion && r.suggestion.locations
+                  ? r.suggestion.locations.map(loc => (
+                      <button key={loc} onClick={() => onApply(r, { location: loc })}
+                        className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">{loc}に</button>
+                    ))
+                  : r.suggestion ? (
+                      <button onClick={() => onApply(r)}
+                        className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">反映</button>
+                    ) : (r.status === 'missingOffice' && r.entry) && (
+                      <button onClick={() => onEdit(r.entry)}
+                        className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">
+                        <i className="fa-solid fa-pen mr-1"></i>編集
+                      </button>
+                    )}
+              </div>
+            </div>
+          </div>
+        );
+      };
 
       return (
         <div className="bg-white rounded-2xl shadow-sm p-4 space-y-3">
           <div className="flex items-center justify-between gap-2">
             <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
               <i className="fa-solid fa-map-location-dot text-blue-400"></i>
-              タイムライン照合
+              照合（打刻・タイムライン）
             </h2>
             <button onClick={onPickFile}
               className="text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 px-3 py-1.5 rounded-lg">
@@ -393,56 +441,43 @@
             </div>
           )}
 
-          {timeline && office && !choosingOffice && (
+          {!choosingOffice && (
             <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <MonthSelect value={month} onChange={onMonthChange} months={months} />
-              </div>
+              <MonthSelect value={month} onChange={onMonthChange} months={months} />
               <div className="flex items-center justify-between text-[11px] text-slate-400">
                 <label className="flex items-center gap-1.5 cursor-pointer">
                   <input type="checkbox" checked={hideOk} onChange={e => setHideOk(e.target.checked)} />
-                  一致した日を隠す（{okCount} 日）
+                  一致した日を隠す
                 </label>
-                <button onClick={() => setChoosingOffice(true)} className="underline">会社の場所を選び直す</button>
+                {timeline && office && (
+                  <button onClick={() => setChoosingOffice(true)} className="underline">会社の場所を選び直す</button>
+                )}
               </div>
-              {shown.length === 0 && (
-                <p className="text-xs text-slate-400 text-center py-3">確認が必要な日はありません</p>
+
+              <h3 className="text-[11px] font-semibold text-slate-500 pt-1">
+                <i className="fa-solid fa-stamp mr-1 text-blue-400"></i>打刻との照合{punchReady && `（一致 ${punchOk} 日）`}
+              </h3>
+              {!gasOn && <p className="text-xs text-slate-400">設定タブで接続すると、開始・終了報告の打刻と照らし合わせます</p>}
+              {gasOn && !punchData && <p className="text-xs text-slate-400">打刻を取得しています…</p>}
+              {gasOn && punchData && punchData.month === month && punchData.error && (
+                <p className="text-xs text-red-600">打刻を取得できませんでした: {punchData.error}</p>
               )}
-              {shown.map(r => {
-                const st = MATCH_STYLES[r.status] || MATCH_STYLES.noData;
-                const { dn } = makeDayLabel(r.date);
-                return (
-                  <div key={r.date} className={`rounded-xl px-3 py-2 text-xs ${st.cls}`}>
-                    <div className="flex items-start gap-2">
-                      <i className={`${st.icon} mt-0.5`}></i>
-                      <div className="flex-1 min-w-0">
-                        <span className="font-bold tabular-nums">{r.date.slice(5).replace('-', '/')}({dn})</span>
-                        {r.entry && <span className="ml-1.5 opacity-70">{r.entry.category}・{r.entry.location || '—'} {r.entry.startTime}〜{r.entry.endTime}</span>}
-                        <span className="block">{r.message}</span>
-                        {r.officeDay && r.officeDay.outMins > 0 && (
-                          <span className="block opacity-70">外出 {r.officeDay.outMins} 分（会社にいた時間 {minsToHHMM(r.officeDay.inMins)}）</span>
-                        )}
-                      </div>
-                      <div className="flex flex-col gap-1 shrink-0">
-                        {r.suggestion && r.suggestion.locations
-                          ? r.suggestion.locations.map(loc => (
-                              <button key={loc} onClick={() => onApply(r, { location: loc })}
-                                className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">{loc}に</button>
-                            ))
-                          : r.suggestion ? (
-                              <button onClick={() => onApply(r)}
-                                className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">反映</button>
-                            ) : (r.status === 'missingOffice' && r.entry) && (
-                              <button onClick={() => onEdit(r.entry)}
-                                className="bg-white/80 hover:bg-white font-semibold px-2 py-1 rounded-lg">
-                                <i className="fa-solid fa-pen mr-1"></i>編集
-                              </button>
-                            )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+              {punchReady && punchShown.length === 0 && (
+                <p className="text-xs text-slate-400 text-center py-2">確認が必要な日はありません</p>
+              )}
+              {punchShown.map(r => renderRow(r, 'p' + r.date))}
+
+              {timeline && office && (
+                <>
+                  <h3 className="text-[11px] font-semibold text-slate-500 pt-2">
+                    <i className="fa-solid fa-map-location-dot mr-1 text-blue-400"></i>タイムラインとの照合（一致 {okCount} 日）
+                  </h3>
+                  {shown.length === 0 && (
+                    <p className="text-xs text-slate-400 text-center py-2">確認が必要な日はありません</p>
+                  )}
+                  {shown.map(r => renderRow(r, 't' + r.date))}
+                </>
+              )}
             </div>
           )}
         </div>
@@ -864,25 +899,69 @@
         return () => document.removeEventListener('visibilitychange', onVisible);
       }, []);
 
-      /* ---------- Chatwork 報告（GAS経由） ---------- */
+      /* ---------- 開始・終了報告（打刻ログへの追記と Chatwork 投稿を1回で送り、成功したらその日の記録を自動保存） ---------- */
       const sendChatwork = async (type) => {
         if (!gasReady()) return;
+        const PU      = window.KintaiPunch;
+        // 始業と終業が同じ（同じ30分のうちに開始・終了を押した）ときは、日をまたいだとみなさず実働0にする
+        const workMins = (x) => (x.startTime && x.startTime === x.endTime) ? 0 : calcActualMins(x.startTime, x.endTime, x.breakTime);
+        const nowMs   = Date.now();
+        const plan    = PU.planPunch({ type, nowMs, entries, location: form.location, tasks: selectedTasks });
         const tasksStr = selectedTasks.length > 0 ? selectedTasks.join(', ') : '記載なし';
-        const loc      = form.location || 'リモート';
+        const loc      = (plan.entry && plan.entry.location) || form.location || 'リモート';
         let message;
         if (type === 'start') {
           message = `【開始報告】\n[場所] ${loc}\n[作業内容] ${tasksStr}\n業務を開始します。`;
         } else {
-          const h = minsToHoursStr(calcActualMins(form.startTime, form.endTime, form.breakTime));
+          const src = plan.entry || form;
+          const h = minsToHoursStr(workMins(src));
           message = `【終了報告】本日の業務を終了しました。（実働：約${h}時間 / 実施業務：${tasksStr}）`;
         }
+        const clientTime = `${PU.jstDate(nowMs)}T${PU.jstTime(nowMs)}:${pad(new Date(nowMs).getSeconds())}+09:00`;
         try {
-          await gasPost({ action: 'notify', message });
-          showToast(`${type === 'start' ? '開始' : '終了'}報告を送信しました`);
+          await gasPost({ action: 'punch', type, source: 'app', clientTime, date: plan.date, location: loc, message });
         } catch (err) {
           showToast(`送信に失敗: ${err.message}`, 'error');
+          return;
         }
+        const label = type === 'start' ? '開始' : '終了';
+        if (plan.skipped) { showToast(`${label}報告を送信しました。${plan.skipped}`, 'error'); return; }
+
+        const actualMins = workMins(plan.entry);
+        const entry = { ...plan.entry, actualMins, deemedMins: getDeemedMins(plan.entry.category),
+                        id: plan.entry.id || Date.now() };
+        setEntries(prev => plan.isNew
+          ? [...prev, entry].sort((a, b) => a.date.localeCompare(b.date))
+          : prev.map(e => e.date === entry.date ? entry : e));
+        pushRecord('save', { action: 'saveRecord', ...entry });
+        // 同じ日をフォームで開いていれば、保存した内容に合わせる
+        if (form.date === entry.date) {
+          setForm(prev => ({ ...prev, startTime: entry.startTime, endTime: entry.endTime, location: entry.location }));
+          if (!editingId) setEditingId(entry.id);
+        }
+        const t = type === 'start' ? entry.startTime : entry.endTime;
+        showToast(`${label}報告を送信し、${entry.date.slice(5).replace('-', '/')} の${type === 'start' ? '始業' : '終業'}を ${t} で保存しました`);
       };
+
+      /* ---------- 打刻ログの取得（照合パネル用） ---------- */
+      const [punchData, setPunchData] = useState(null); // { month, punches } | { month, error }
+      useEffect(() => {
+        if (tab !== 'list' || !gasConfigured()) return;
+        let cancelled = false;
+        (async () => {
+          try {
+            const url = `${gasUrl.trim()}?action=getPunches&month=${reportMonth}&key=${encodeURIComponent(accessKey.trim())}`;
+            const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const json = await res.json();
+            if (json.status !== 'ok') throw new Error(json.message || '取得に失敗しました');
+            if (!cancelled) setPunchData({ month: reportMonth, punches: Array.isArray(json.punches) ? json.punches : [] });
+          } catch (err) {
+            if (!cancelled) setPunchData({ month: reportMonth, error: String(err.message || err) });
+          }
+        })();
+        return () => { cancelled = true; };
+      }, [tab, reportMonth, gasUrl, accessKey]);
 
       /* ---------- 成果物管理 ---------- */
       const addDeliverable = () => {
@@ -1428,7 +1507,8 @@
                   onPickFile={() => timelineRef.current && timelineRef.current.click()}
                   choosingOffice={choosingOffice} setChoosingOffice={setChoosingOffice}
                   saveOffice={saveOffice} onApply={applySuggestion}
-                  onEdit={e => { editEntry(entries.find(x => x.id === e.id) || e); setReturnToList(true); }} />
+                  onEdit={e => { editEntry(entries.find(x => x.id === e.id) || e); setReturnToList(true); }}
+                  punchData={punchData} gasOn={gasConfigured()} />
                 {entries.length === 0 ? (
                   <div className="text-center py-20 text-slate-400">
                     <i className="fa-regular fa-folder-open text-5xl mb-4 block"></i>

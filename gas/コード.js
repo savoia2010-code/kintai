@@ -9,6 +9,10 @@
  *   ACCESS_KEY       : アプリからの読み書きに必要な合言葉（doGet / doPost 共通）
  *   DELETED_DATES    : （自動管理・手で編集しない）アプリで削除した日付の記録。他の端末に削除を伝えるために使う
  *
+ * 受け付けるアクション:
+ *   doPost: saveRecord / deleteRecord / notify / uploadFile / punch（打刻ログへ追記）
+ *   doGet : getRecords / getPunches（打刻ログの取得）
+ *
  * シート命名規則: {WORKER_NAME}/{YY}/{MM}
  *   例: 山田/26/03
  *
@@ -27,6 +31,7 @@
 function doPost(e) {
   try {
     const data = JSON.parse(e.postData.contents);
+    let result;
 
     const keyError = checkAccessKey(data.key);
     if (keyError) return respond({ status: 'error', message: keyError });
@@ -35,8 +40,11 @@ function doPost(e) {
     else if (data.action === 'deleteRecord') { deleteRecord(data);                                                       }
     else if (data.action === 'notify')       { sendChatwork(data.message);                                               }
     else if (data.action === 'uploadFile')   { uploadFileToChatwork(data.base64Data, data.fileName, data.mimeType, data.message); }
+    else if (data.action === 'punch')        { result = punch(data);                                                     }
     else    { throw new Error('不明なアクション: ' + data.action); }
 
+    // 打刻のときだけ、受信日時を返す（他のアクションは { status: 'ok' } のまま）
+    if (data.action === 'punch') return respond({ status: 'ok', receivedAt: result });
     return respond({ status: 'ok' });
 
   } catch (err) {
@@ -424,6 +432,7 @@ function doGet(e) {
     if (action === 'getRecords') {
       return respond({ status: 'ok', entries: getRecords(params.month), deleted: Object.keys(getDeletedDates()) });
     }
+    if (action === 'getPunches') return respond({ status: 'ok', punches: getPunches(params.month) });
     throw new Error('不明なアクション: ' + action);
 
   } catch (err) {
@@ -495,6 +504,105 @@ function readSheetRecords(sheet) {
       notes:      String(row[8] || '').trim(),
     });
   }
+  return out;
+}
+
+// ============================================================
+// 打刻ログ（追加だけ・消さない）
+// ============================================================
+
+const PUNCH_SHEET_NAME = '打刻ログ';
+const PUNCH_HEADER     = ['受信日時', '端末の時刻', '日付', '種別', '場所', '送り元'];
+const PUNCH_TYPE_LABEL   = { start: '開始', end: '終了', arrive: '到着', leave: '出発' };
+const PUNCH_SOURCE_LABEL = { app: 'アプリ', shortcut: 'ショートカット' };
+
+/**
+ * 打刻を打刻ログへ1行追加し、message があれば Chatwork に投稿する
+ * @return {string} 受信日時（'yyyy-MM-dd HH:mm:ss'、日本時間）
+ */
+function punch(data) {
+  const type = data.type;
+  if (!Object.prototype.hasOwnProperty.call(PUNCH_TYPE_LABEL, type)) {
+    throw new Error('不明な打刻の種別: ' + type);
+  }
+  const source = data.source || 'shortcut';
+  if (!Object.prototype.hasOwnProperty.call(PUNCH_SOURCE_LABEL, source)) {
+    throw new Error('不明な打刻の送り元: ' + source);
+  }
+
+  const now        = new Date();
+  const receivedAt = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy-MM-dd HH:mm:ss');
+  const date = (typeof data.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.date))
+    ? data.date
+    : Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy-MM-dd');
+  const clientTime = typeof data.clientTime === 'string' ? data.clientTime : '';
+  const location   = ['リモート', '出社', '混在'].indexOf(data.location) >= 0 ? data.location : '';
+
+  const row = [receivedAt, clientTime, date, PUNCH_TYPE_LABEL[type], location, PUNCH_SOURCE_LABEL[source]];
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = getSpreadsheet();
+    let sheet = ss.getSheetByName(PUNCH_SHEET_NAME);
+    if (!sheet) {
+      sheet = ss.insertSheet(PUNCH_SHEET_NAME);
+      sheet.getRange(1, 1, 1, PUNCH_HEADER.length).setValues([PUNCH_HEADER]).setFontWeight('bold');
+      sheet.setFrozenRows(1);
+    }
+    const target = sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length);
+    target.setNumberFormat('@');   // 日付・時刻に自動変換させず、文字列のまま残す
+    target.setValues([row]);
+  } finally {
+    lock.releaseLock();
+  }
+
+  // 先にログへ残してから Chatwork へ投稿する
+  if (typeof data.message === 'string' && data.message) sendChatwork(data.message);
+
+  return receivedAt;
+}
+
+/**
+ * 打刻ログを取得する
+ * @param {string} month 'YYYY-MM'（○月度。前月26日〜当月25日）
+ */
+function getPunches(month) {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(month || ''));
+  if (!m) throw new Error('month は YYYY-MM で指定してください');
+  const year = parseInt(m[1], 10), mon = parseInt(m[2], 10);
+  if (mon < 1 || mon > 12) throw new Error('month は YYYY-MM で指定してください');
+
+  let py = year, pm = mon - 1;
+  if (pm < 1) { pm = 12; py -= 1; }
+  const start = `${py}-${zeroPad(pm)}-26`;
+  const end   = `${year}-${zeroPad(mon)}-25`;
+
+  const sheet = getSpreadsheet().getSheetByName(PUNCH_SHEET_NAME);
+  if (!sheet) return [];
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+
+  const typeCode   = {}; Object.keys(PUNCH_TYPE_LABEL).forEach(k => { typeCode[PUNCH_TYPE_LABEL[k]] = k; });
+  const sourceCode = {}; Object.keys(PUNCH_SOURCE_LABEL).forEach(k => { sourceCode[PUNCH_SOURCE_LABEL[k]] = k; });
+
+  // セルが日付型に変わっていても読めるよう、文字列に直す
+  const text = (v, fmt) => v instanceof Date ? Utilities.formatDate(v, 'Asia/Tokyo', fmt) : String(v == null ? '' : v);
+
+  const out = [];
+  sheet.getRange(2, 1, last - 1, PUNCH_HEADER.length).getValues().forEach(r => {
+    const date = text(r[2], 'yyyy-MM-dd');
+    if (date < start || date > end) return;
+    const type = String(r[3]), source = String(r[5]);
+    out.push({
+      receivedAt: text(r[0], 'yyyy-MM-dd HH:mm:ss'),
+      clientTime: text(r[1], "yyyy-MM-dd'T'HH:mm:ssXXX"),
+      date:       date,
+      type:       typeCode[type] || type,
+      location:   String(r[4]),
+      source:     sourceCode[source] || source,
+    });
+  });
   return out;
 }
 
