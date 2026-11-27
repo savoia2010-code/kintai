@@ -156,3 +156,60 @@ test('matchPeriod respects range bounds and sorts', () => {
   assert.equal(rows[0].entry, entries[0]);
   assert.equal(rows[1].officeDay, od.get('2026-10-02'));
 });
+
+// ---- 実データで見つかった問題への対策 ----
+const vseg = (d, s, e, pid, lat, lng) => ({
+  startTime: `${d}T${s}:00.000+09:00`, endTime: `${d}T${e}:00.000+09:00`,
+  visit: { hierarchyLevel: '0', probability: '0.8',
+           topCandidate: { placeID: pid, semanticType: 'Unknown', probability: '0.7', placeLocation: `geo:${lat},${lng}` } },
+});
+const weekdays = ['2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05', '2026-11-06'];
+
+test('home (stays overnight) is excluded from office candidates', () => {
+  const data = [];
+  weekdays.forEach(d => {
+    data.push(vseg(d, '00:00', '08:30', 'HOME', 10.5, 20.5));
+    data.push(vseg(d, '18:30', '23:59', 'HOME', 10.5, 20.5));
+  });
+  weekdays.slice(0, 3).forEach(d => data.push(vseg(d, '09:00', '18:00', 'OFFICE', 10.0, 20.0)));
+  // 自宅で一日中リモートワークした日
+  data.push(vseg('2026-11-09', '00:00', '23:59', 'HOME', 10.5, 20.5));
+  const c = T.findOfficeCandidates(T.parseTimeline(data).visits);
+  assert.equal(c.length, 1);
+  assert.equal(c[0].office.placeId, 'OFFICE');
+});
+
+test('nearby place IDs on the same site are merged into one candidate', () => {
+  // 約100m 離れた別の場所ID（同じ敷地）
+  const data = [
+    vseg('2026-11-02', '09:00', '18:00', 'OFFICE_A', 10.0, 20.0),
+    vseg('2026-11-03', '09:00', '18:00', 'OFFICE_A', 10.0, 20.0),
+    vseg('2026-11-04', '09:00', '12:00', 'OFFICE_B', 10.0009, 20.0),
+    vseg('2026-11-04', '13:00', '18:00', 'OFFICE_A', 10.0, 20.0),
+    vseg('2026-11-05', '09:00', '18:00', 'FAR', 11.0, 21.0),
+  ];
+  const visits = T.parseTimeline(data).visits;
+  const c = T.findOfficeCandidates(visits);
+  assert.equal(c[0].days, 3);
+  assert.deepEqual([...c[0].office.placeIds].sort(), ['OFFICE_A', 'OFFICE_B']);
+  // placeIds のどれかに一致すれば会社の滞在（座標が無くても）
+  assert.equal(T.isOfficeVisit({ placeId: 'OFFICE_B', lat: null, lng: null }, c[0].office), true);
+  const days = T.summarizeOfficeDays(visits, c[0].office, { from: '2026-11-01', to: '2026-11-30' });
+  assert.equal(days.get('2026-11-04').stays, 2);
+});
+
+test('candidates only look at the last year of data by default', () => {
+  const data = [
+    vseg('2024-06-03', '09:00', '18:00', 'OLD', 12.0, 22.0),
+    vseg('2024-06-04', '09:00', '18:00', 'OLD', 12.0, 22.0),
+    vseg('2026-11-02', '09:00', '18:00', 'NEW', 10.0, 20.0),
+  ];
+  const c = T.findOfficeCandidates(T.parseTimeline(data).visits);
+  assert.deepEqual(c.map(x => x.office.placeId), ['NEW']);
+});
+
+test('weekend office day without a record suggests 休日出勤', () => {
+  const od = new Map([['2026-11-07', { arrive: '10:00', leave: '15:00', inMins: 300, outMins: 0, stays: 1 }]]);
+  const rows = T.matchPeriod([], od, new Set(['2026-11-07']), { from: '2026-11-01', to: '2026-11-30' });
+  assert.equal(rows[0].suggestion.category, '休日出勤');
+});

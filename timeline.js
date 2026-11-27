@@ -121,16 +121,28 @@
     opts = opts || {};
     var minStay = opts.minStayMins != null ? opts.minStayMins : 30;
     var radius = opts.radiusM != null ? opts.radiusM : 150;
+    // 同じ敷地が別々の場所IDに分かれていることがあるので、この距離内の場所は1つにまとめる
+    var mergeRadius = opts.mergeRadiusM != null ? opts.mergeRadiusM : 200;
     var limit = opts.limit != null ? opts.limit : 5;
+    // 夜（0〜5時）に1時間以上いた日がこの割合以上の場所は自宅とみなして外す
+    var nightRatio = opts.nightRatio != null ? opts.nightRatio : 0.3;
+    // 既定ではデータの最終日から1年以内だけを見る（昔の職場を上位に出さない）
+    var since = opts.since;
+    if (since === undefined) {
+      var maxEnd = (visits || []).reduce(function (m, v) { return v.end > m ? v.end : m; }, 0);
+      since = maxEnd ? jstDate(maxEnd - 365 * DAY_MS) : null;
+    }
 
     var pieces = [];
     (visits || []).forEach(function (v) {
       splitByDay(v).forEach(function (p) {
+        if (since && p.date < since) return;
+        var night = Math.min(p.endMins, 300) - p.startMins >= 60;
         var dow = dayOfWeek(p.date);
-        if (dow === 0 || dow === 6) return;
         var a = Math.max(p.startMins, 480), b = Math.min(p.endMins, 1200);
-        if (b - a < minStay) return;
-        pieces.push({ date: p.date, a: a, b: b, visit: v });
+        var day = dow !== 0 && dow !== 6 && b - a >= minStay;
+        if (!day && !night) return;
+        pieces.push({ date: p.date, a: a, b: b, day: day, night: night, visit: v });
       });
     });
 
@@ -144,7 +156,7 @@
       }
     }
     function newPlace(pid) {
-      return { placeId: pid, pieces: [], n: 0, sLat: 0, sLng: 0, lat: null, lng: null };
+      return { placeId: pid, placeIds: pid ? [pid] : [], pieces: [], n: 0, sLat: 0, sLng: 0, lat: null, lng: null };
     }
     // 1周目: 場所IDあり
     pieces.forEach(function (pc) {
@@ -154,6 +166,20 @@
       if (!pl) { pl = newPlace(pid); places.push(pl); byPid.set(pid, pl); }
       addTo(pl, pc);
     });
+    // 近い場所IDどうしをまとめる（滞在の多い場所を主にする）
+    places.sort(function (x, y) { return y.pieces.length - x.pieces.length; });
+    var merged = [];
+    places.forEach(function (pl) {
+      var host = pl.lat === null ? null : merged.find(function (m) {
+        return m.lat !== null && distanceM(pl.lat, pl.lng, m.lat, m.lng) <= mergeRadius;
+      });
+      if (!host) { merged.push(pl); return; }
+      host.pieces = host.pieces.concat(pl.pieces);
+      host.placeIds = host.placeIds.concat(pl.placeIds);
+      host.n += pl.n; host.sLat += pl.sLat; host.sLng += pl.sLng;
+      host.lat = host.sLat / host.n; host.lng = host.sLng / host.n;
+    });
+    places = merged;
     // 2周目: 場所IDなし（近さ）
     pieces.forEach(function (pc) {
       if (pc.visit.placeId) return;
@@ -171,8 +197,11 @@
     });
 
     var results = places.map(function (pl) {
-      var byDate = {};
-      pl.pieces.forEach(function (pc) { (byDate[pc.date] = byDate[pc.date] || []).push([pc.a, pc.b]); });
+      var byDate = {}, nights = {};
+      pl.pieces.forEach(function (pc) {
+        if (pc.night) nights[pc.date] = true;
+        if (pc.day) (byDate[pc.date] = byDate[pc.date] || []).push([pc.a, pc.b]);
+      });
       var dates = Object.keys(byDate).sort();
       var total = 0;
       dates.forEach(function (d) { total += unionLength(byDate[d]); });
@@ -184,9 +213,10 @@
         avgMins: dates.length ? Math.round(total / dates.length) : 0,
         firstDate: dates[0],
         lastDate: dates[dates.length - 1],
-        office: { placeId: pl.placeId, lat: pl.lat, lng: pl.lng }
+        nightDays: Object.keys(nights).length,
+        office: { placeId: pl.placeId, placeIds: pl.placeIds, lat: pl.lat, lng: pl.lng }
       };
-    });
+    }).filter(function (r) { return r.days > 0 && r.nightDays < r.days * nightRatio; });
     results.sort(function (x, y) { return y.days - x.days || y.avgMins - x.avgMins; });
     return results.slice(0, limit);
   }
@@ -194,7 +224,10 @@
   function isOfficeVisit(visit, office, radiusM) {
     if (!visit || !office) return false;
     var r = radiusM != null ? radiusM : 150;
-    if (visit.placeId && office.placeId && visit.placeId === office.placeId) return true;
+    if (visit.placeId) {
+      var ids = office.placeIds && office.placeIds.length ? office.placeIds : (office.placeId ? [office.placeId] : []);
+      if (ids.indexOf(visit.placeId) >= 0) return true;
+    }
     if (hasCoords(visit) && hasCoords(office)) {
       return distanceM(visit.lat, visit.lng, office.lat, office.lng) <= r;
     }
@@ -297,6 +330,13 @@
       var od = officeDays && officeDays.get ? officeDays.get(date) : undefined;
       var has = !!(coveredDates && coveredDates.has(date));
       var r = compareDay(entry, od, has);
+      if (r && r.status === 'suggestNew') {
+        var dow = dayOfWeek(date);
+        if (dow === 0 || dow === 6) {
+          r = { status: r.status, message: '記録なし・休日に会社に滞在',
+                suggestion: Object.assign({}, r.suggestion, { category: '休日出勤' }) };
+        }
+      }
       if (r) rows.push({ date: date, entry: entry, officeDay: od, status: r.status, message: r.message, suggestion: r.suggestion });
     }
     return rows;
